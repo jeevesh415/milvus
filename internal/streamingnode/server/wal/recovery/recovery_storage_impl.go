@@ -99,6 +99,9 @@ type recoveryStorageImpl struct {
 	pendingPersistSnapshot *RecoverySnapshot
 	// used to mark switch MQ msg found
 	alterWALInfo *AlterWALInfo
+	// pendingSalvageCheckpoint holds the salvage checkpoint captured during force promote.
+	// Set under r.mu; consumed and persisted by the background task to avoid holding the lock.
+	pendingSalvageCheckpoint *utility.ReplicateCheckpoint
 }
 
 // Metrics gets the metrics of the wal.
@@ -181,7 +184,7 @@ func (r *recoveryStorageImpl) notifyPersist() {
 func (r *recoveryStorageImpl) consumeDirtySnapshot() *RecoverySnapshot {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.dirtyCounter == 0 {
+	if r.dirtyCounter == 0 && r.pendingSalvageCheckpoint == nil {
 		return nil
 	}
 
@@ -205,12 +208,17 @@ func (r *recoveryStorageImpl) consumeDirtySnapshot() *RecoverySnapshot {
 			vchannels[vchannel.meta.Vchannel] = dirtySnapshot
 		}
 	}
+	// Atomically capture the salvage checkpoint alongside other dirty state.
+	// Clearing it here (under r.mu) ensures it is only consumed once.
+	salvageCP := r.pendingSalvageCheckpoint
+	r.pendingSalvageCheckpoint = nil
 	// clear the dirty counter.
 	r.dirtyCounter = 0
 	return &RecoverySnapshot{
 		VChannels:          vchannels,
 		SegmentAssignments: segments,
 		Checkpoint:         r.checkpoint.Clone(),
+		SalvageCheckpoint:  salvageCP,
 	}
 }
 
@@ -245,21 +253,35 @@ func (r *recoveryStorageImpl) observeMessage(msg message.ImmutableMessage) {
 func (r *recoveryStorageImpl) updateCheckpoint(msg message.ImmutableMessage) {
 	if msg.MessageType() == message.MessageTypeAlterReplicateConfig {
 		cfg := message.MustAsImmutableAlterReplicateConfigMessageV2(msg)
-		r.checkpoint.ReplicateConfig = cfg.Header().ReplicateConfiguration
-		clusterRole := replicateutil.MustNewConfigHelper(r.currentClusterID, cfg.Header().ReplicateConfiguration).GetCurrentCluster()
-		switch clusterRole.Role() {
-		case replicateutil.RolePrimary:
-			r.checkpoint.ReplicateCheckpoint = nil
-		case replicateutil.RoleSecondary:
-			// Update the replicate checkpoint if the cluster role is secondary.
-			sourceClusterID := clusterRole.SourceCluster().GetClusterId()
-			sourcePChannel := clusterRole.MustGetSourceChannel(r.channel.Name)
-			if r.checkpoint.ReplicateCheckpoint == nil || r.checkpoint.ReplicateCheckpoint.ClusterID != sourceClusterID {
-				r.checkpoint.ReplicateCheckpoint = &utility.ReplicateCheckpoint{
-					ClusterID: sourceClusterID,
-					PChannel:  sourcePChannel,
-					MessageID: nil,
-					TimeTick:  0,
+		header := cfg.Header()
+
+		// Check ignore field - if true, skip updating ReplicateConfig and ReplicateCheckpoint
+		// This is used for incomplete switchover messages that should be ignored after force promote
+		if header.Ignore {
+			r.Logger().Info("AlterReplicateConfig message has ignore flag set, skipping checkpoint update",
+				zap.Bool("forcePromote", header.ForcePromote))
+		} else {
+			r.checkpoint.ReplicateConfig = header.ReplicateConfiguration
+			clusterRole := replicateutil.MustNewConfigHelper(r.currentClusterID, header.ReplicateConfiguration).GetCurrentCluster()
+			switch clusterRole.Role() {
+			case replicateutil.RolePrimary:
+				if header.GetForcePromote() && r.checkpoint.ReplicateCheckpoint != nil {
+					// Store for background task to persist; never call etcd while holding r.mu.
+					r.pendingSalvageCheckpoint = r.checkpoint.ReplicateCheckpoint
+					r.notifyPersist()
+				}
+				r.checkpoint.ReplicateCheckpoint = nil
+			case replicateutil.RoleSecondary:
+				// Update the replicate checkpoint if the cluster role is secondary.
+				sourceClusterID := clusterRole.SourceCluster().GetClusterId()
+				sourcePChannel := clusterRole.MustGetSourceChannel(r.channel.Name)
+				if r.checkpoint.ReplicateCheckpoint == nil || r.checkpoint.ReplicateCheckpoint.ClusterID != sourceClusterID {
+					r.checkpoint.ReplicateCheckpoint = &utility.ReplicateCheckpoint{
+						ClusterID: sourceClusterID,
+						PChannel:  sourcePChannel,
+						MessageID: nil,
+						TimeTick:  0,
+					}
 				}
 			}
 		}

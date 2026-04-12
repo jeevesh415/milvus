@@ -22,6 +22,7 @@ import (
 	"io"
 	"maps"
 	"math"
+	"path"
 
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
@@ -500,7 +501,68 @@ func (m *BM25Stats) GetAvgdl() float64 {
 	return float64(m.numToken) / float64(m.numRow)
 }
 
-// DeserializeStats deserialize @blobs as []*PrimaryKeyStats
+// DeserializeBloomFilterStats auto-detects compound vs default stats format
+// from the paths and deserializes accordingly. Compound format is detected
+// when any path has a basename matching CompoundStatsType.LogIdx().
+func DeserializeBloomFilterStats(paths []string, blobs []*Blob) ([]*PrimaryKeyStats, error) {
+	for i, p := range paths {
+		_, logidx := path.Split(p)
+		if logidx == CompoundStatsType.LogIdx() {
+			return DeserializeStatsList(blobs[i])
+		}
+	}
+	return DeserializeStats(blobs)
+}
+
+// bm25StatsPerEntryBytes is the estimated memory cost per entry in the rowsWithToken map.
+// Go map overhead per entry: key(4) + value(4) + bucket/pointer overhead (~72B) ≈ 80 bytes.
+const bm25StatsPerEntryBytes = 80
+
+// MemSize estimates the in-memory size of this BM25Stats in bytes.
+// len(map) is O(1) in Go (reads hmap.count directly).
+func (m *BM25Stats) MemSize() int64 {
+	// Fixed overhead: numRow(8) + numToken(8) + map header (~100B)
+	return 120 + int64(len(m.rowsWithToken))*bm25StatsPerEntryBytes
+}
+
+// DeserializeFromReader reads BM25 stats from an io.Reader and accumulates into self.
+// Unlike Deserialize([]byte), this does not require knowing the total size upfront.
+func (m *BM25Stats) DeserializeFromReader(r io.Reader) error {
+	var version int32
+	if err := binary.Read(r, common.Endian, &version); err != nil {
+		return err
+	}
+
+	var numRow, tokenNum int64
+	if err := binary.Read(r, common.Endian, &numRow); err != nil {
+		return err
+	}
+	if err := binary.Read(r, common.Endian, &tokenNum); err != nil {
+		return err
+	}
+
+	m.numRow += numRow
+	m.numToken += tokenNum
+
+	var key uint32
+	var value int32
+	for {
+		if err := binary.Read(r, common.Endian, &key); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if err := binary.Read(r, common.Endian, &value); err != nil {
+			return err
+		}
+		m.rowsWithToken[key] += value
+	}
+
+	return nil
+}
+
+// DeserializeStats deserializes @blobs as []*PrimaryKeyStats
 func DeserializeStats(blobs []*Blob) ([]*PrimaryKeyStats, error) {
 	results := make([]*PrimaryKeyStats, 0, len(blobs))
 	for _, blob := range blobs {

@@ -168,7 +168,7 @@ func (node *DataNode) initSession() error {
 	if node.session == nil {
 		return errors.New("failed to initialize session")
 	}
-	node.session.Init(typeutil.DataNodeRole, node.address, false, true)
+	node.session.Init(typeutil.DataNodeRole, node.address, false)
 	sessionutil.SaveServerInfo(typeutil.DataNodeRole, node.session.ServerID)
 	return nil
 }
@@ -200,13 +200,19 @@ func (node *DataNode) Init() error {
 
 		fileMode := fileresource.ParseMode(paramtable.Get().CommonCfg.DNFileResourceMode.GetValue())
 		if fileMode == fileresource.SyncMode {
-			cm, err := node.storageFactory.NewChunkManager(node.ctx, compaction.CreateStorageConfig())
-			if err != nil {
-				log.Error("Init chunk manager for file resource manager failed", zap.Error(err))
-				initError = err
-				return
+			storageConfig := compaction.CreateStorageConfig()
+			if storageConfig.GetStorageType() != "local" && storageConfig.GetAddress() == "" {
+				log.Info("No storage address configured in yaml, file resource sync mode is disabled")
+				fileresource.InitManager(nil, fileresource.CloseMode)
+			} else {
+				cm, err := node.storageFactory.NewChunkManager(node.ctx, storageConfig)
+				if err != nil {
+					log.Error("Init chunk manager for file resource manager failed", zap.Error(err))
+					initError = err
+					return
+				}
+				fileresource.InitManager(cm, fileMode)
 			}
-			fileresource.InitManager(cm, fileMode)
 		} else {
 			fileresource.InitManager(nil, fileMode)
 		}

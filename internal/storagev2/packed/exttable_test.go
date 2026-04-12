@@ -291,6 +291,52 @@ func TestGetColumnNamesFromSchema_WithExternalField(t *testing.T) {
 	assert.Equal(t, []string{"external_id", "vector", "raw_text"}, columns)
 }
 
+func TestGetColumnNamesFromSchema_ExternalCollectionSkipsSystemFields(t *testing.T) {
+	// External collection: ExternalSource is set.
+	// Fields without ExternalField (like __virtual_pk__) should be skipped.
+	schema := &schemapb.CollectionSchema{
+		ExternalSource: "s3://bucket/data",
+		Fields: []*schemapb.FieldSchema{
+			{Name: "__virtual_pk__", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{Name: "id_field", ExternalField: "id"},
+			{Name: "vec_field", ExternalField: "embedding"},
+		},
+	}
+	columns := GetColumnNamesFromSchema(schema)
+	// Only external field mappings should be returned, __virtual_pk__ is skipped
+	assert.Equal(t, []string{"id", "embedding"}, columns)
+}
+
+func TestGetColumnNamesFromSchema_ExternalCollectionAllFieldsMapped(t *testing.T) {
+	// All user fields have ExternalField mappings
+	schema := &schemapb.CollectionSchema{
+		ExternalSource: "s3://bucket/data",
+		Fields: []*schemapb.FieldSchema{
+			{Name: "__virtual_pk__", DataType: schemapb.DataType_Int64, IsPrimaryKey: true},
+			{Name: "a", ExternalField: "col_a"},
+			{Name: "b", ExternalField: "col_b"},
+			{Name: "c", ExternalField: "col_c"},
+		},
+	}
+	columns := GetColumnNamesFromSchema(schema)
+	assert.Equal(t, []string{"col_a", "col_b", "col_c"}, columns)
+}
+
+func TestGetColumnNamesFromSchema_MixedExternalAndNonExternal(t *testing.T) {
+	// Non-external collection with some fields having ExternalField set
+	// (edge case: ExternalSource not set, but some fields have ExternalField)
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{Name: "pk", DataType: schemapb.DataType_Int64},
+			{Name: "ext_field", ExternalField: "ext_col"},
+			{Name: "normal_field"},
+		},
+	}
+	columns := GetColumnNamesFromSchema(schema)
+	// Non-external collection: all fields included, external field uses mapping name
+	assert.Equal(t, []string{"pk", "ext_col", "normal_field"}, columns)
+}
+
 func TestGetColumnNamesFromSchema_EmptyFields(t *testing.T) {
 	schema := &schemapb.CollectionSchema{
 		Fields: []*schemapb.FieldSchema{},
@@ -367,6 +413,69 @@ func TestMarshalManifestPath_EmptyBasePath(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "", basePath)
 	assert.Equal(t, int64(0), ver)
+}
+
+func TestCompareManifestPath(t *testing.T) {
+	base := "/base/path/to/segment"
+
+	t.Run("equal paths", func(t *testing.T) {
+		a := MarshalManifestPath(base, 5)
+		cmp, err := CompareManifestPath(a, a)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, cmp)
+	})
+
+	t.Run("both empty", func(t *testing.T) {
+		cmp, err := CompareManifestPath("", "")
+		assert.NoError(t, err)
+		assert.Equal(t, 0, cmp)
+	})
+
+	t.Run("a older than b", func(t *testing.T) {
+		a := MarshalManifestPath(base, 1)
+		b := MarshalManifestPath(base, 5)
+		cmp, err := CompareManifestPath(a, b)
+		assert.NoError(t, err)
+		assert.Equal(t, -1, cmp)
+	})
+
+	t.Run("a newer than b", func(t *testing.T) {
+		a := MarshalManifestPath(base, 10)
+		b := MarshalManifestPath(base, 3)
+		cmp, err := CompareManifestPath(a, b)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, cmp)
+	})
+
+	t.Run("different base paths returns error", func(t *testing.T) {
+		a := MarshalManifestPath("/path/a", 1)
+		b := MarshalManifestPath("/path/b", 1)
+		_, err := CompareManifestPath(a, b)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "different base paths")
+	})
+
+	t.Run("invalid json a returns error", func(t *testing.T) {
+		b := MarshalManifestPath(base, 1)
+		_, err := CompareManifestPath("not-json", b)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse manifest path")
+	})
+
+	t.Run("invalid json b returns error", func(t *testing.T) {
+		a := MarshalManifestPath(base, 1)
+		_, err := CompareManifestPath(a, "not-json")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to parse manifest path")
+	})
+
+	t.Run("negative version", func(t *testing.T) {
+		a := MarshalManifestPath(base, -1)
+		b := MarshalManifestPath(base, 0)
+		cmp, err := CompareManifestPath(a, b)
+		assert.NoError(t, err)
+		assert.Equal(t, -1, cmp)
+	})
 }
 
 func TestCreateSegmentManifest_CanceledContext(t *testing.T) {

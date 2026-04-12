@@ -43,6 +43,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/retry"
@@ -193,8 +194,8 @@ func (s *SyncTaskSuite) createSegment(storageVersion int64) *metacache.SegmentIn
 	if storageVersion == storage.StorageV3 {
 		k := fmt.Sprintf("%d/%d/%d", s.collectionID, s.partitionID, s.segmentID)
 		basePath := fmt.Sprintf("insert_log/%s", k)
-		// Use JSON format for manifest path: {"ver": -1, "base_path": "..."}
-		segInfo.ManifestPath = packed.MarshalManifestPath(basePath, -1)
+		// Use JSON format for manifest path: {"ver": 0, "base_path": "..."}
+		segInfo.ManifestPath = packed.MarshalManifestPath(basePath, packed.ManifestEarliest)
 	}
 
 	seg := metacache.NewSegmentInfo(segInfo, bfs, nil)
@@ -463,7 +464,7 @@ func (s *SyncTaskSuite) TestRunError() {
 		handler := func(_ error) { flag = true }
 		s.chunkManager.ExpectedCalls = nil
 		s.chunkManager.EXPECT().RootPath().Return("files")
-		s.chunkManager.EXPECT().Write(mock.Anything, mock.Anything, mock.Anything).Return(retry.Unrecoverable(errors.New("mocked")))
+		s.chunkManager.EXPECT().Write(mock.Anything, mock.Anything, mock.Anything).Return(merr.WrapErrIoPermissionDenied("mocked-key", errors.New("mocked")))
 		task := s.getSuiteSyncTask(new(SyncPack).WithInsertData([]*storage.InsertData{s.getInsertBuffer()})).
 			WithFailureCallback(handler).
 			WithWriteRetryOptions(retry.AttemptAlways(), retry.MaxSleepTime(10*time.Second))

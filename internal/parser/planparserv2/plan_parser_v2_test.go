@@ -1925,7 +1925,7 @@ func Test_SegmentScorers(t *testing.T) {
 
 	t.Run("error - not segment scorer flag", func(t *testing.T) {
 		fs := &schemapb.FunctionScore{
-			Functions: []*schemapb.FunctionSchema{{Params: []*commonpb.KeyValuePair{{Key: "reranker", Value: rerank.WeightedName}}}},
+			Functions: []*schemapb.FunctionSchema{{Params: []*commonpb.KeyValuePair{{Key: "reranker", Value: "weighted"}}}},
 		}
 		plan, err := CreateSearchPlan(schema, "", "FloatVectorField", &planpb.QueryInfo{GroupByFieldId: -1}, nil, fs)
 		assert.NoError(t, err)
@@ -2563,6 +2563,9 @@ func TestExpr_ElementFilter(t *testing.T) {
 
 		`element_filter(struct_array, $[sub_int] > 1) || element_filter(struct_array, $[sub_str] == "test")`,
 		`element_filter(struct_array, $[sub_int] > 1) && Int64Field > 0`,
+
+		`not element_filter(struct_array, $[sub_int] > 1)`,
+		`!element_filter(struct_array, $[sub_int] > 1)`,
 	}
 
 	for _, expr := range invalidExprs {

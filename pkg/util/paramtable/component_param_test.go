@@ -36,6 +36,10 @@ func TestComponentParam(t *testing.T) {
 	Init()
 	params := Get()
 
+	t.Run("query node zero copy config key", func(t *testing.T) {
+		assert.Equal(t, "queryNode.search.enableResultZeroCopy", params.QueryNodeCfg.EnableResultZeroCopy.Key)
+	})
+
 	t.Run("test commonConfig", func(t *testing.T) {
 		Params := &params.CommonCfg
 
@@ -110,6 +114,12 @@ func TestComponentParam(t *testing.T) {
 
 		params.Save("common.preCreatedTopic.timeticker", "timeticker")
 		assert.Equal(t, []string{"timeticker"}, Params.TimeTicker.GetAsStrings())
+
+		assert.True(t, params.CommonCfg.BloomFilterEnabled.GetAsBool())
+		params.Save("common.bloomFilterEnabled", "false")
+		assert.False(t, params.CommonCfg.BloomFilterEnabled.GetAsBool())
+		params.Reset("common.bloomFilterEnabled")
+		assert.True(t, params.CommonCfg.BloomFilterEnabled.GetAsBool())
 
 		assert.Equal(t, 1000, params.CommonCfg.BloomFilterApplyBatchSize.GetAsInt())
 
@@ -503,7 +513,7 @@ func TestComponentParam(t *testing.T) {
 
 		assert.Equal(t, 2, Params.BloomFilterApplyParallelFactor.GetAsInt())
 		assert.Equal(t, true, Params.SkipGrowingSegmentBF.GetAsBool())
-		assert.Equal(t, true, Params.EnableSparseFilterInQuery.GetAsBool())
+		assert.Equal(t, true, Params.EnableSegmentFilter.GetAsBool())
 
 		assert.Equal(t, "/var/lib/milvus/data/mmap", Params.MmapDirPath.GetValue())
 
@@ -702,6 +712,7 @@ func TestComponentParam(t *testing.T) {
 		assert.Equal(t, 10*time.Minute, params.StreamingCfg.FlushL0MaxLifetime.GetAsDurationByParse())
 		assert.Equal(t, 500000, params.StreamingCfg.FlushL0MaxRowNum.GetAsInt())
 		assert.Equal(t, int64(32*1024*1024), params.StreamingCfg.FlushL0MaxSize.GetAsSize())
+		assert.Equal(t, 30, params.StreamingCfg.OldVersionLastConfirmedWindowSize.GetAsInt())
 		assert.Equal(t, 2*time.Second, params.StreamingCfg.DelegatorEmptyTimeTickMaxFilterInterval.GetAsDurationByParse())
 		assert.Equal(t, 1*time.Second, params.StreamingCfg.FlushEmptyTimeTickMaxFilterInterval.GetAsDurationByParse())
 		assert.Equal(t, 0, params.StreamingCfg.WALBalancerExpectedInitialStreamingNodeNum.GetAsInt())
@@ -868,6 +879,7 @@ func TestCachedParam(t *testing.T) {
 
 	assert.Equal(t, uint(100000), params.CommonCfg.BloomFilterSize.GetAsUint())
 	assert.Equal(t, uint(100000), params.CommonCfg.BloomFilterSize.GetAsUint())
+	assert.True(t, params.CommonCfg.BloomFilterEnabled.GetAsBool())
 	assert.Equal(t, "BlockedBloomFilter", params.CommonCfg.BloomFilterType.GetValue())
 
 	assert.Equal(t, uint64(8388608), params.ServiceParam.MQCfg.PursuitBufferSize.GetAsUint64())

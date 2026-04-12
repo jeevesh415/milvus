@@ -201,6 +201,54 @@ func (b *broadcastTask) PendingBroadcastMessages() []message.MutableMessage {
 	return pendingMessages
 }
 
+// IsAlterReplicateConfigMessage returns true if this task is an AlterReplicateConfig message.
+func (b *broadcastTask) IsAlterReplicateConfigMessage() bool {
+	return b.msg.MessageType() == message.MessageTypeAlterReplicateConfig
+}
+
+// IsForcePromoteMessage returns true if this task is a force promote AlterReplicateConfig message.
+func (b *broadcastTask) IsForcePromoteMessage() bool {
+	if b.msg.MessageType() != message.MessageTypeAlterReplicateConfig {
+		return false
+	}
+	alterMsg, err := message.AsMutableAlterReplicateConfigMessageV2(b.msg)
+	if err != nil {
+		return false
+	}
+	return alterMsg.Header().ForcePromote
+}
+
+// MarkIgnore marks the task's message header with ignore=true in memory.
+// This is used for force promote to mark incomplete AlterReplicateConfig messages as ignored.
+// This is a memory-only operation — no etcd persistence needed because:
+// 1. The ignore flag only needs to take effect during the subsequent ack callback in the same process.
+// 2. If the coordinator crashes, force promote must be re-executed anyway.
+func (b *broadcastTask) MarkIgnore() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Parse the message as AlterReplicateConfig
+	msg := message.NewBroadcastMutableMessageBeforeAppend(b.task.Message.Payload, b.task.Message.Properties)
+	alterMsg, err := message.AsMutableAlterReplicateConfigMessageV2(msg)
+	if err != nil {
+		return errors.Wrap(err, "failed to parse message as AlterReplicateConfigMessage")
+	}
+
+	// Get current header and set ignore to true
+	header := alterMsg.Header()
+	header.Ignore = true
+	alterMsg.OverwriteHeader(header)
+
+	// Re-create the broadcast message from updated payload and properties
+	// The OverwriteHeader call above modified the underlying messageImpl properties
+	updatedMsg := message.NewBroadcastMutableMessageBeforeAppend(b.task.Message.Payload, b.task.Message.Properties)
+
+	// Update the task's in-memory message
+	b.task.Message = updatedMsg.IntoMessageProto()
+	b.msg = updatedMsg
+	return nil
+}
+
 // InitializeRecovery initializes the recovery of the broadcast task.
 func (b *broadcastTask) InitializeRecovery(ctx context.Context) error {
 	b.mu.Lock()

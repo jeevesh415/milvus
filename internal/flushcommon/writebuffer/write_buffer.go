@@ -533,8 +533,8 @@ func (wb *writeBufferBase) CreateNewGrowingSegment(partitionID int64, segmentID 
 			// set manifest path when creating segment
 			k := metautil.JoinIDPath(wb.collectionID, partitionID, segmentID)
 			basePath := path.Join(paramtable.Get().ServiceParam.MinioCfg.RootPath.GetValue(), common.SegmentInsertLogPath, k)
-			// -1 for first write
-			manifestPath = packed.MarshalManifestPath(basePath, -1)
+			// ManifestEarliest for first write
+			manifestPath = packed.MarshalManifestPath(basePath, packed.ManifestEarliest)
 		}
 		segmentInfo := &datapb.SegmentInfo{
 			ID:             segmentID,
@@ -632,6 +632,7 @@ func (wb *writeBufferBase) getSyncTask(ctx context.Context, segmentID int64) (sy
 		WithMetaCache(wb.metaCache).
 		WithSchema(schema).
 		WithSyncPack(pack).
+		WithStorageConfig(packed.CreateStorageConfig()).
 		WithWriteRetryOptions(retry.AttemptAlways(), retry.MaxSleepTime(10*time.Second))
 	return task, nil
 }

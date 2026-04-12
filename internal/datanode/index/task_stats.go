@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/compaction"
@@ -39,6 +40,7 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
@@ -73,8 +75,9 @@ type statsTask struct {
 	binlogIO io.BinlogIO
 	cm       storage.ChunkManager
 
-	logIDOffset int64
-	currentTime time.Time
+	logIDOffset  int64
+	currentTime  time.Time
+	manifestPath string // current manifest version, updated after each AddStatsToManifest
 }
 
 type BuildIndexOptions struct {
@@ -266,20 +269,51 @@ func (st *statsTask) sort(ctx context.Context) ([]*datapb.FieldBinlog, error) {
 		return nil, err
 	}
 
-	binlogs, stats, bm25stats, _, _ := srw.GetLogs()
+	binlogs, stats, bm25stats, manifestPath, _ := srw.GetLogs()
 	insertLogs := storage.SortFieldBinlogs(binlogs)
 	if err := binlog.CompressFieldBinlogs(insertLogs); err != nil {
 		return nil, err
 	}
+	st.manifestPath = manifestPath
 
-	statsLogs := []*datapb.FieldBinlog{stats}
-	if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
-		return nil, err
+	// For V3 segments, register bloom filter and BM25 stats in manifest.
+	// After registration, stats/bm25stats are set to nil so the legacy
+	// binlog-compress path below is skipped for these fields.
+	if st.manifestPath != "" {
+		var statEntries []packed.StatEntry
+		if stats != nil {
+			statEntries = append(statEntries, packed.FieldBinlogStatEntry("bloom_filter", stats.GetFieldID(), stats))
+		}
+		for fieldID, bm25stat := range bm25stats {
+			statEntries = append(statEntries, packed.FieldBinlogStatEntry("bm25", fieldID, bm25stat))
+		}
+
+		if len(statEntries) > 0 {
+			newManifest, err := packed.AddStatsToManifest(
+				st.manifestPath, st.req.GetStorageConfig(), statEntries)
+			if err != nil {
+				return nil, fmt.Errorf("failed to add stats to manifest: %w", err)
+			}
+			st.manifestPath = newManifest
+		}
+		stats = nil
+		bm25stats = nil
 	}
 
-	bm25StatsLogs := lo.Values(bm25stats)
-	if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
-		return nil, err
+	var statsLogs []*datapb.FieldBinlog
+	if stats != nil {
+		statsLogs = []*datapb.FieldBinlog{stats}
+		if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
+			return nil, err
+		}
+	}
+
+	var bm25StatsLogs []*datapb.FieldBinlog
+	if len(bm25stats) > 0 {
+		bm25StatsLogs = lo.Values(bm25stats)
+		if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
+			return nil, err
+		}
 	}
 
 	st.manager.StorePKSortStatsResult(st.req.GetClusterID(),
@@ -288,7 +322,8 @@ func (st *statsTask) sort(ctx context.Context) ([]*datapb.FieldBinlog, error) {
 		st.req.GetPartitionID(),
 		st.req.GetTargetSegmentID(),
 		st.req.GetInsertChannel(),
-		int64(numValidRows), insertLogs, statsLogs, bm25StatsLogs)
+		int64(numValidRows), insertLogs, statsLogs, bm25StatsLogs,
+		st.manifestPath)
 
 	debug.FreeOSMemory()
 	elapse := st.tr.RecordSpan()
@@ -312,6 +347,7 @@ func (st *statsTask) Execute(ctx context.Context) error {
 	ctx, span := otel.Tracer(typeutil.IndexNodeRole).Start(ctx, fmt.Sprintf("Stats-Execute-%s-%d", st.req.GetClusterID(), st.req.GetTaskID()))
 	defer span.End()
 
+	st.manifestPath = st.req.GetManifestPath()
 	insertLogs := st.req.GetInsertLogs()
 	var err error
 	if st.req.GetSubJobType() == indexpb.StatsSubJob_Sort {
@@ -513,16 +549,36 @@ func (st *statsTask) createTextIndex(ctx context.Context,
 
 			req := proto.Clone(st.req).(*workerpb.CreateStatsRequest)
 			req.InsertLogs = insertBinlogs
-			buildIndexParams := buildIndexParams(req, files, field, newStorageConfig, nil)
+			req.ManifestPath = st.manifestPath
+			statsBasePath, err := computeStatsBasePath(req, st.manifestPath, "text_index", field.GetFieldID())
+			if err != nil {
+				return err
+			}
+			buildIndexParams := buildIndexParams(req, files, field, newStorageConfig, nil, statsBasePath)
+			buildIndexParams.IndexParams = []*commonpb.KeyValuePair{
+				{Key: "index_type", Value: "INVERTED"},
+				{Key: "is_text_match", Value: "true"},
+			}
 
 			// set analyzer extra info
 			if len(analyzerExtraInfo) > 0 {
 				buildIndexParams.AnalyzerExtraInfo = analyzerExtraInfo
 			}
 
-			uploaded, err := indexcgowrapper.CreateTextIndex(egCtx, buildIndexParams)
+			index, err := indexcgowrapper.CreateIndex(egCtx, buildIndexParams)
 			if err != nil {
 				return err
+			}
+			defer index.Delete()
+
+			indexStats, err := index.UpLoad()
+			if err != nil {
+				return err
+			}
+
+			uploaded := make(map[string]int64)
+			for _, info := range indexStats.GetSerializedIndexInfos() {
+				uploaded[info.FileName] = info.FileSize
 			}
 
 			mu.Lock()
@@ -534,7 +590,7 @@ func (st *statsTask) createTextIndex(ctx context.Context,
 				Files:                     lo.Keys(uploaded),
 				LogSize:                   totalSize,
 				MemorySize:                totalSize,
-				CurrentScalarIndexVersion: common.CurrentScalarIndexEngineVersion,
+				CurrentScalarIndexVersion: common.ClampScalarIndexVersion(st.req.GetCurrentScalarIndexVersion()),
 			}
 			mu.Unlock()
 
@@ -551,13 +607,44 @@ func (st *statsTask) createTextIndex(ctx context.Context,
 		return err
 	}
 
+	// When manifest_path is set, register text index stats in manifest.
+	// C++ Upload() returns relative paths; convert to absolute by prepending basePath
+	// before registering with manifest (loon library expects absolute paths).
+	// Use a separate copy for manifest so the original stats retain relative paths
+	// for dual-write to etcd (etcd stores relative paths, reconstructed on read).
+	if st.manifestPath != "" && len(textIndexLogs) > 0 {
+		manifestStats := make(map[int64]*datapb.TextIndexStats, len(textIndexLogs))
+		for fieldID, stats := range textIndexLogs {
+			cloned := proto.Clone(stats).(*datapb.TextIndexStats)
+			basePath, err := computeStatsBasePath(st.req, st.manifestPath, "text_index", stats.GetFieldID())
+			if err != nil {
+				return err
+			}
+			for i, f := range cloned.GetFiles() {
+				cloned.Files[i] = basePath + "/" + f
+			}
+			manifestStats[fieldID] = cloned
+		}
+		statEntries := packed.TextIndexStatEntries(manifestStats, st.req.GetCurrentScalarIndexVersion())
+		newManifest, err := packed.AddStatsToManifest(
+			st.manifestPath, st.req.GetStorageConfig(), statEntries)
+		if err != nil {
+			return fmt.Errorf("failed to add text index stats to manifest: %w", err)
+		}
+		st.manifestPath = newManifest
+		// Dual-write: keep textIndexLogs populated so it is stored in segment metadata as a
+		// placeholder. This prevents stats_inspector from re-triggering TextIndexJob for V3
+		// segments that already have text index stats in the manifest.
+	}
+
 	st.manager.StoreStatsTextIndexResult(st.req.GetClusterID(),
 		st.req.GetTaskID(),
 		st.req.GetCollectionID(),
 		st.req.GetPartitionID(),
 		st.req.GetTargetSegmentID(),
 		st.req.GetInsertChannel(),
-		textIndexLogs)
+		textIndexLogs,
+		st.manifestPath)
 	totalElapse := st.tr.RecordSpan()
 	log.Info("create text index done",
 		zap.Int64("target segmentID", st.req.GetTargetSegmentID()),
@@ -603,12 +690,12 @@ func (st *statsTask) createJSONKeyStats(ctx context.Context,
 		return binlog.GetFieldID()
 	})
 
-	getInsertFiles := func(fieldID int64) ([]string, error) {
+	getInsertFiles := func(fieldID int64, enableNull bool) ([]string, error) {
 		if st.req.GetStorageVersion() == storage.StorageV2 || st.req.GetStorageVersion() == storage.StorageV3 {
 			return []string{}, nil
 		}
 		binlogs, ok := fieldBinlogs[fieldID]
-		if !ok {
+		if !ok && !enableNull {
 			return nil, fmt.Errorf("field binlog not found for field %d", fieldID)
 		}
 		result := make([]string, 0, len(binlogs))
@@ -642,19 +729,24 @@ func (st *statsTask) createJSONKeyStats(ctx context.Context,
 		log.Info("field enable json key index, ready to create json key index", zap.Int64("field id", field.GetFieldID()))
 
 		eg.Go(func() error {
-			files, err := getInsertFiles(field.GetFieldID())
+			files, err := getInsertFiles(field.GetFieldID(), field.GetNullable())
 			if err != nil {
 				return err
 			}
 
 			req := proto.Clone(st.req).(*workerpb.CreateStatsRequest)
 			req.InsertLogs = insertBinlogs
+			req.ManifestPath = st.manifestPath
 			options := &BuildIndexOptions{
 				JsonStatsMaxShreddingColumns: jsonStatsMaxShreddingColumns,
 				JsonStatsShreddingRatio:      jsonStatsShreddingRatioThreshold,
 				JsonStatsWriteBatchSize:      jsonStatsWriteBatchSize,
 			}
-			buildIndexParams := buildIndexParams(req, files, field, newStorageConfig, options)
+			statsBasePath, err := computeStatsBasePath(req, st.manifestPath, "json_key_index", field.GetFieldID())
+			if err != nil {
+				return err
+			}
+			buildIndexParams := buildIndexParams(req, files, field, newStorageConfig, options, statsBasePath)
 
 			statsResult, err := indexcgowrapper.CreateJSONKeyStats(egCtx, buildIndexParams)
 			if err != nil {
@@ -693,6 +785,36 @@ func (st *statsTask) createJSONKeyStats(ctx context.Context,
 		return err
 	}
 
+	// When manifest_path is set, register JSON key stats in manifest.
+	// C++ Upload() returns relative paths; convert to absolute by prepending basePath
+	// before registering with manifest (loon library expects absolute paths).
+	// Use a separate copy for manifest so the original stats retain relative paths
+	// for dual-write to etcd (etcd stores relative paths, reconstructed on read).
+	if st.manifestPath != "" && len(jsonKeyIndexStats) > 0 {
+		manifestStats := make(map[int64]*datapb.JsonKeyStats, len(jsonKeyIndexStats))
+		for fieldID, stats := range jsonKeyIndexStats {
+			cloned := proto.Clone(stats).(*datapb.JsonKeyStats)
+			basePath, err := computeStatsBasePath(st.req, st.manifestPath, "json_key_index", stats.GetFieldID())
+			if err != nil {
+				return err
+			}
+			for i, f := range cloned.GetFiles() {
+				cloned.Files[i] = basePath + "/" + f
+			}
+			manifestStats[fieldID] = cloned
+		}
+		statEntries := packed.JSONKeyStatEntries(manifestStats)
+		newManifest, err := packed.AddStatsToManifest(
+			st.manifestPath, st.req.GetStorageConfig(), statEntries)
+		if err != nil {
+			return fmt.Errorf("failed to add JSON key stats to manifest: %w", err)
+		}
+		st.manifestPath = newManifest
+		// Dual-write: keep jsonKeyIndexStats populated so it is stored in segment metadata as a
+		// placeholder. This prevents stats_inspector from re-triggering JsonKeyIndexJob for V3
+		// segments that already have JSON key stats in the manifest.
+	}
+
 	totalElapse := st.tr.RecordSpan()
 
 	st.manager.StoreJSONKeyStatsResult(st.req.GetClusterID(),
@@ -701,7 +823,8 @@ func (st *statsTask) createJSONKeyStats(ctx context.Context,
 		st.req.GetPartitionID(),
 		st.req.GetTargetSegmentID(),
 		st.req.GetInsertChannel(),
-		jsonKeyIndexStats)
+		jsonKeyIndexStats,
+		st.manifestPath)
 
 	metrics.DataNodeBuildJSONStatsLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10)).Observe(totalElapse.Seconds())
 	log.Info("create json key index done",
@@ -710,12 +833,39 @@ func (st *statsTask) createJSONKeyStats(ctx context.Context,
 	return nil
 }
 
+// computeStatsBasePath computes the remote base path for stats files.
+// V2 segments use the traditional top-level directory paths (text_log/, json_stats/).
+// V3 segments use basePath/_stats/{type}.{fieldID} under the segment's manifest base path.
+func computeStatsBasePath(req *workerpb.CreateStatsRequest, manifestPath string, statsType string, fieldID int64) (string, error) {
+	if req.GetStorageVersion() == storage.StorageV3 {
+		basePath, _, err := packed.UnmarshalManifestPath(manifestPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to unmarshal manifest path for %s basePath: %w", statsType, err)
+		}
+		return fmt.Sprintf("%s/_stats/%s.%d", basePath, statsType, fieldID), nil
+	}
+	// V2: compute traditional path
+	rootPath := req.GetStorageConfig().GetRootPath()
+	switch statsType {
+	case "text_index":
+		return metautil.BuildTextIndexPrefix(rootPath,
+			req.GetTaskID(), req.GetTaskVersion(),
+			req.GetCollectionID(), req.GetPartitionID(), req.GetTargetSegmentID(), fieldID), nil
+	case "json_key_index":
+		return metautil.BuildJSONKeyStatsPrefix(rootPath, common.JSONStatsDataFormatVersion,
+			req.GetTaskID(), req.GetTaskVersion(),
+			req.GetCollectionID(), req.GetPartitionID(), req.GetTargetSegmentID(), fieldID), nil
+	}
+	return "", fmt.Errorf("unknown stats type: %s", statsType)
+}
+
 func buildIndexParams(
 	req *workerpb.CreateStatsRequest,
 	files []string,
 	field *schemapb.FieldSchema,
 	storageConfig *indexcgopb.StorageConfig,
 	options *BuildIndexOptions,
+	statsBasePath string,
 ) *indexcgopb.BuildIndexInfo {
 	if options == nil {
 		options = &BuildIndexOptions{}
@@ -730,12 +880,13 @@ func buildIndexParams(
 		InsertFiles:                      files,
 		FieldSchema:                      field,
 		StorageConfig:                    storageConfig,
-		CurrentScalarIndexVersion:        req.GetCurrentScalarIndexVersion(),
+		CurrentScalarIndexVersion:        common.ClampScalarIndexVersion(req.GetCurrentScalarIndexVersion()),
 		StorageVersion:                   req.GetStorageVersion(),
 		JsonStatsMaxShreddingColumns:     options.JsonStatsMaxShreddingColumns,
 		JsonStatsShreddingRatioThreshold: options.JsonStatsShreddingRatio,
 		JsonStatsWriteBatchSize:          options.JsonStatsWriteBatchSize,
 		Manifest:                         req.GetManifestPath(),
+		StatsBasePath:                    statsBasePath,
 	}
 
 	if req.GetStorageVersion() == storage.StorageV2 || req.GetStorageVersion() == storage.StorageV3 {

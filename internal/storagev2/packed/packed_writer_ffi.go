@@ -43,7 +43,7 @@ import (
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 )
 
-func createStorageConfig() *indexpb.StorageConfig {
+func CreateStorageConfig() *indexpb.StorageConfig {
 	var storageConfig *indexpb.StorageConfig
 
 	if paramtable.Get().CommonCfg.StorageType.GetValue() == "local" {
@@ -69,6 +69,7 @@ func createStorageConfig() *indexpb.StorageConfig {
 			RequestTimeoutMs:  paramtable.Get().MinioCfg.RequestTimeoutMs.GetAsInt64(),
 			GcpCredentialJSON: paramtable.Get().MinioCfg.GcpCredentialJSON.GetValue(),
 			SslTlsMinVersion:  paramtable.Get().MinioCfg.SslTLSMinVersion.GetValue(),
+			UseCrc32CChecksum: paramtable.Get().MinioCfg.UseCRC32C.GetAsBool(),
 		}
 	}
 
@@ -85,7 +86,7 @@ func NewFFIPackedWriter(basePath string, baseVersion int64, schema *arrow.Schema
 	defer cdata.ReleaseCArrowSchema(&cas)
 
 	if storageConfig == nil {
-		storageConfig = createStorageConfig()
+		storageConfig = CreateStorageConfig()
 	}
 
 	pattern := strings.Join(lo.Map(columnGroups, func(columnGroup storagecommon.ColumnGroup, _ int) string {
@@ -178,7 +179,7 @@ func (pw *FFIPackedWriter) Close() (string, error) {
 	defer C.free(unsafe.Pointer(cBasePath))
 	var transationHandle C.LoonTransactionHandle
 
-	result = C.loon_transaction_begin(cBasePath, pw.cProperties, C.int64_t(pw.baseVersion), 1, &transationHandle)
+	result = C.loon_transaction_begin(cBasePath, pw.cProperties, C.int64_t(pw.baseVersion), C.LOON_TRANSACTION_RESOLVE_OVERWRITE /* resolve_id */, getRetryLimit() /* retry_limit */, &transationHandle)
 	if err := HandleLoonFFIResult(result); err != nil {
 		return "", err
 	}

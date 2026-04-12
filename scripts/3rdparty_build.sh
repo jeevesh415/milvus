@@ -64,11 +64,11 @@ done
 
 # Validate build type
 case "${BUILD_TYPE}" in
-  Debug|Release)
+  Debug|Release|RelWithDebInfo|MinSizeRel)
     echo "Build type: ${BUILD_TYPE}"
     ;;
   *)
-    echo "Invalid build type: ${BUILD_TYPE}. Valid options are: Debug, Release"
+    echo "Invalid build type: ${BUILD_TYPE}. Valid options are: Debug, Release, RelWithDebInfo, MinSizeRel"
     exit 1
     ;;
 esac
@@ -117,6 +117,8 @@ unset DYLD_LIBRARY_PATH
 unset DYLD_INSERT_LIBRARIES
 
 export CONAN_REVISIONS_ENABLED=1
+# Enable parallel downloads for faster dependency resolution
+export CONAN_CPU_COUNT=${CONAN_CPU_COUNT:-$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)}
 export CXXFLAGS="-Wno-error=address -Wno-error=deprecated-declarations -include cstdint"
 export CFLAGS="-Wno-error=address -Wno-error=deprecated-declarations"
 # LLVM from Homebrew doesn't set TARGET_OS_OSX=1 (unlike Apple's clang), which causes

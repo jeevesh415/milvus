@@ -44,6 +44,8 @@ func InitSegcore(nodeID int64) error {
 	C.IndexBuilderInit(cGlogConf)
 	C.free(unsafe.Pointer(cGlogConf))
 
+	C.LogOpenSSLFIPSStatus()
+
 	// update log level based on current setup
 	initcore.UpdateLogLevel(paramtable.Get().LogCfg.Level.GetValue())
 
@@ -63,6 +65,8 @@ func InitSegcore(nodeID int64) error {
 	C.SetMiddlePriorityThreadCoreCoefficient(cMiddlePriorityThreadCoreCoefficient)
 	cLowPriorityThreadCoreCoefficient := C.float(paramtable.Get().CommonCfg.LowPriorityThreadCoreCoefficient.GetAsFloat())
 	C.SetLowPriorityThreadCoreCoefficient(cLowPriorityThreadCoreCoefficient)
+	cThreadPoolMaxThreadsSize := C.int(paramtable.Get().CommonCfg.ThreadPoolMaxThreadsSize.GetAsInt())
+	C.SetThreadPoolMaxThreadsSize(cThreadPoolMaxThreadsSize)
 
 	cCPUNum := C.int(hardware.GetCPUNum())
 	C.InitCpuNum(cCPUNum)
@@ -78,7 +82,9 @@ func InitSegcore(nodeID int64) error {
 	C.SegcoreSetKnowhereBuildThreadPoolNum(cKnowhereThreadPoolSize)
 
 	localDataRootPath := pathutil.GetPath(pathutil.LocalChunkPath, nodeID)
-	initcore.InitLocalChunkManager(localDataRootPath)
+	if err := initcore.InitLocalChunkManager(localDataRootPath); err != nil {
+		return err
+	}
 	cGpuMemoryPoolInitSize := C.uint32_t(paramtable.Get().GpuConfig.InitSize.GetAsUint32())
 	cGpuMemoryPoolMaxSize := C.uint32_t(paramtable.Get().GpuConfig.MaxSize.GetAsUint32())
 	C.SegcoreSetKnowhereGpuMemoryPoolSize(cGpuMemoryPoolInitSize, cGpuMemoryPoolMaxSize)

@@ -133,8 +133,8 @@ var routeToMethod = map[string]string{
 	"/v2/vectordb/roles/drop":                "DropRole",
 	"/v2/vectordb/roles/grant_privilege":     "OperatePrivilege",
 	"/v2/vectordb/roles/revoke_privilege":    "OperatePrivilege",
-	"/v2/vectordb/roles/grant_privilege_v2":  "OperatePrivilege",
-	"/v2/vectordb/roles/revoke_privilege_v2": "OperatePrivilege",
+	"/v2/vectordb/roles/grant_privilege_v2":  "OperatePrivilegeV2",
+	"/v2/vectordb/roles/revoke_privilege_v2": "OperatePrivilegeV2",
 
 	"/v2/vectordb/privilege_groups/create":                       "CreatePrivilegeGroup",
 	"/v2/vectordb/privilege_groups/drop":                         "DropPrivilegeGroup",
@@ -376,7 +376,7 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 		ctx = proxy.NewContextWithMetadata(ctx, username.(string), dbName)
 		traceID := span.SpanContext().TraceID().String()
 		ctx = log.WithTraceID(ctx, traceID)
-		gCtx.Keys["traceID"] = traceID
+		gCtx.Set("traceID", traceID)
 		log.Ctx(ctx).Debug("high level restful api, read parameters from request body, then start to handle.",
 			zap.Any("url", gCtx.Request.URL.Path))
 
@@ -2567,7 +2567,7 @@ func (h *HandlersV2) operatePrivilegeToRoleV2(ctx context.Context, c *gin.Contex
 		DbName:         httpReq.DbName,
 		CollectionName: httpReq.CollectionName,
 	}
-	resp, err := wrapperProxy(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/OperatePrivilege", func(reqCtx context.Context, req any) (interface{}, error) {
+	resp, err := wrapperProxy(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/OperatePrivilegeV2", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.OperatePrivilegeV2(reqCtx, req.(*milvuspb.OperatePrivilegeV2Request))
 	})
 	if err == nil {

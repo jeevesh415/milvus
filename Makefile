@@ -57,8 +57,19 @@ use_opendal = OFF
 ifdef USE_OPENDAL
 	use_opendal = ${USE_OPENDAL}
 endif
+
+use_svs = OFF
+ifdef USE_SVS
+	use_svs = ${USE_SVS}
+endif
+
+# FIPS: default OFF. Set MILVUS_FIPS_ENABLED=ON to enable BoringCrypto.
+GOEXPERIMENT_FLAG :=
+ifeq ($(MILVUS_FIPS_ENABLED),ON)
+	GOEXPERIMENT_FLAG := GOEXPERIMENT=boringcrypto
+endif
 # golangci-lint
-GOLANGCI_LINT_VERSION := 1.64.7
+GOLANGCI_LINT_VERSION := 2.11.3
 GOLANGCI_LINT_OUTPUT := $(shell $(INSTALL_PATH)/golangci-lint --version 2>/dev/null)
 INSTALL_GOLANGCI_LINT := $(findstring $(GOLANGCI_LINT_VERSION), $(GOLANGCI_LINT_OUTPUT))
 # mockery
@@ -74,7 +85,7 @@ GOFUMPT_VERSION := 0.5.0
 GOFUMPT_OUTPUT := $(shell $(INSTALL_PATH)/gofumpt --version 2>/dev/null)
 INSTALL_GOFUMPT := $(findstring $(GOFUMPT_VERSION),$(GOFUMPT_OUTPUT))
 # gotestsum
-GOTESTSUM_VERSION := 1.11.0
+GOTESTSUM_VERSION := 1.13.0
 GOTESTSUM_OUTPUT := $(shell $(INSTALL_PATH)/gotestsum --version 2>/dev/null)
 INSTALL_GOTESTSUM := $(findstring $(GOTESTSUM_VERSION),$(GOTESTSUM_OUTPUT))
 # protoc-gen-go
@@ -106,7 +117,7 @@ build-go:
 	@echo "Building Milvus ..."
 	@source $(PWD)/scripts/setenv.sh && \
 		mkdir -p $(INSTALL_PATH) && go env -w CGO_ENABLED="1" && \
-		CGO_LDFLAGS="$${CGO_LDFLAGS} $(CGO_LDFLAGS)" CGO_CFLAGS="$${CGO_CFLAGS} $(CGO_CFLAGS)" GO111MODULE=on $(GO) build -pgo=$(PGO_PATH)/default.pgo -ldflags="-r $${RPATH} -X '$(OBJPREFIX).BuildTags=$(BUILD_TAGS)' -X '$(OBJPREFIX).BuildTime=$(BUILD_TIME)' -X '$(OBJPREFIX).GitCommit=$(GIT_COMMIT)' -X '$(OBJPREFIX).GoVersion=$(GO_VERSION)' -X '$(OBJPREFIX).MilvusVersion=$(MILVUS_VERSION)'" \
+		$(GOEXPERIMENT_FLAG) CGO_LDFLAGS="$${CGO_LDFLAGS} $(CGO_LDFLAGS)" CGO_CFLAGS="$${CGO_CFLAGS} $(CGO_CFLAGS)" GO111MODULE=on $(GO) build -pgo=$(PGO_PATH)/default.pgo -ldflags="-r $${RPATH} -X '$(OBJPREFIX).BuildTags=$(BUILD_TAGS)' -X '$(OBJPREFIX).BuildTime=$(BUILD_TIME)' -X '$(OBJPREFIX).GitCommit=$(GIT_COMMIT)' -X '$(OBJPREFIX).GoVersion=$(GO_VERSION)' -X '$(OBJPREFIX).MilvusVersion=$(MILVUS_VERSION)'" \
 		-tags $(MILVUS_GO_BUILD_TAGS) -o $(INSTALL_PATH)/milvus $(PWD)/cmd/main.go 1>/dev/null
 
 milvus-gpu: build-cpp-gpu print-gpu-build-info
@@ -200,7 +211,8 @@ lint-fix: getdeps
 	@$(INSTALL_PATH)/gofumpt -l -w tests/go_client/
 	@$(INSTALL_PATH)/gofumpt -l -w tests/integration/
 	@echo "Running gci fix"
-	@$(INSTALL_PATH)/gci write cmd/ --skip-generated -s standard -s default -s "prefix(github.com/milvus-io)" --custom-order
+# Skip boring_enabled.go: gci misclassifies crypto/boring (a std lib package) as third-party, conflicting with gofumpt
+	@find cmd/ -name '*.go' ! -name 'boring_enabled.go' | xargs $(INSTALL_PATH)/gci write --skip-generated -s standard -s default -s "prefix(github.com/milvus-io)" --custom-order
 	@$(INSTALL_PATH)/gci write internal/ --skip-generated -s standard -s default -s "prefix(github.com/milvus-io)" --custom-order
 	@$(INSTALL_PATH)/gci write pkg/ --skip-generated -s standard -s default -s "prefix(github.com/milvus-io)" --custom-order
 	@$(INSTALL_PATH)/gci write client/ --skip-generated -s standard -s default -s "prefix(github.com/milvus-io)" --custom-order
@@ -250,7 +262,7 @@ BUILD_TIME = $(shell date -u)
 GIT_COMMIT = $(shell git rev-parse --short HEAD)
 GO_VERSION = $(shell go version)
 BUILD_DATE = $(shell date -u +%Y%m%d)
-MILVUS_VERSION := $(shell tag=$$(git describe --exact-match --tags 2>/dev/null) && echo "$$tag" | sed 's/^v//' || echo "$(GIT_BRANCH_SAFE)-$(BUILD_DATE)-$(GIT_COMMIT)")
+MILVUS_VERSION := $(shell tag=$$(git describe --exact-match --tags --match 'v*' 2>/dev/null) && echo "$$tag" | sed 's/^v//' || echo "$(GIT_BRANCH_SAFE)-$(BUILD_DATE)-$(GIT_COMMIT)")
 
 print-build-info:
 	@echo "Build Tag: $(BUILD_TAGS)"
@@ -286,19 +298,19 @@ generated-proto: download-milvus-proto build-3rdparty get-proto-deps
 
 build-cpp: generated-proto plan-parser-lib
 	@echo "Building Milvus cpp library ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features) -S ${use_svs})
 
 build-cpp-gpu: generated-proto plan-parser-lib
 	@echo "Building Milvus cpp gpu library ... "
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -g -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -g -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features) -S ${use_svs})
 
 build-cpp-with-unittest: generated-proto plan-parser-lib
 	@echo "Building Milvus cpp library with unittest ... "
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features) -S ${use_svs})
 
 build-cpp-with-coverage: generated-proto plan-parser-lib
 	@echo "Building Milvus cpp library with coverage and unittest ..."
-	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -c -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features))
+	@(env bash $(PWD)/scripts/core_build.sh -t ${mode} -a ${use_asan} -u -c -n ${use_disk_index} -y ${use_dynamic_simd} ${AZURE_OPTION} -x ${index_engine} -o ${use_opendal} -f $(tantivy_features) -S ${use_svs})
 
 check-proto-product: generated-proto
 	 @(env bash $(PWD)/scripts/check_proto_product.sh)
@@ -554,7 +566,6 @@ generate-mockery-kv: getdeps
 	$(INSTALL_PATH)/mockery --name=TxnKV --dir=$(PWD)/pkg/kv --output=$(PWD)/internal/kv/mocks --filename=txn_kv.go --with-expecter
 	$(INSTALL_PATH)/mockery --name=MetaKv --dir=$(PWD)/pkg/kv --output=$(PWD)/internal/kv/mocks --filename=meta_kv.go --with-expecter
 	$(INSTALL_PATH)/mockery --name=WatchKV --dir=$(PWD)/pkg/kv --output=$(PWD)/internal/kv/mocks --filename=watch_kv.go --with-expecter
-	$(INSTALL_PATH)/mockery --name=SnapShotKV --dir=$(PWD)/pkg/kv --output=$(PWD)/internal/kv/mocks --filename=snapshot_kv.go --with-expecter
 	$(INSTALL_PATH)/mockery --name=Predicate --dir=$(PWD)/pkg/kv/predicates --output=$(PWD)/internal/kv/predicates --filename=mock_predicate.go --with-expecter --inpackage
 
 generate-mockery-chunk-manager: getdeps

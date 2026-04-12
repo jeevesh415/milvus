@@ -100,12 +100,22 @@ LoadWithStrategy(const std::vector<std::string>& remote_files,
 
 // ---- Cell-batch loading ----
 
+// The channel capacity multiplier relative to pool size.
+// The bounded channel holds at most (pool_size * kChannelCapacityMultiplier) items,
+// providing backpressure to producer threads while keeping them busy.
+constexpr double kChannelCapacityMultiplier = 1.5;
+
+// Safety margin for loading overhead upper bound estimation.
+// Covers Arrow Table alignment overhead, metadata, and other estimation errors.
+constexpr double kLoadingOverheadInflationRatio = 1.2;
+
 // A cell specification: identifies a cell's location within a specific file.
 struct CellSpec {
     int64_t cid;              // cell id
     size_t file_idx;          // index into the remote_files list
     int64_t local_rg_offset;  // file-local row group start offset
     int64_t rg_count;         // number of row groups in this cell
+    int64_t memory_size = 0;  // estimated Arrow memory in bytes; 0 = unknown
 };
 
 // Result of loading a single cell: cid + the arrow tables read.

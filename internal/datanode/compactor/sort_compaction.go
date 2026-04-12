@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/compaction"
@@ -37,6 +38,7 @@ import (
 	"github.com/milvus-io/milvus/internal/flushcommon/io"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/storage"
+	"github.com/milvus-io/milvus/internal/storagev2/packed"
 	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/internal/util/fileresource"
 	"github.com/milvus-io/milvus/internal/util/indexcgowrapper"
@@ -202,6 +204,7 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 		storage.WithStorageConfig(t.compactionParams.StorageConfig))
 	if err != nil {
 		log.Warn("load deletePKs failed", zap.Error(err))
+		srw.Close()
 		return nil, err
 	}
 	loadDeltaCost := time.Since(phaseStart)
@@ -260,6 +263,7 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 	}
 	if err != nil {
 		log.Warn("error creating insert binlog reader", zap.Error(err))
+		srw.Close()
 		return nil, err
 	}
 	defer rr.Close()
@@ -269,6 +273,7 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 	numValidRows, sortTimings, err := storage.Sort(t.compactionParams.BinLogMaxSize, t.plan.GetSchema(), rrs, srw, predicate, t.sortByFieldIDs)
 	if err != nil {
 		log.Warn("sort failed", zap.Error(err))
+		srw.Close()
 		return nil, err
 	}
 	if sortTimings == nil {
@@ -283,19 +288,35 @@ func (t *sortCompactionTask) sortSegment(ctx context.Context) (*datapb.Compactio
 
 	phaseStart = time.Now()
 	binlogs, stats, bm25stats, manifest, expirQuantiles := srw.GetLogs()
+
+	// For V3 segments, bloom filter and BM25 stats are already written to
+	// basePath/_stats/ and registered in the manifest by writeStatsV3()
+	// during PackedManifestRecordWriter.Close(). stats and bm25stats will
+	// be nil; only the manifest carries stats information.
+	if manifest != "" {
+		stats = nil
+		bm25stats = nil
+	}
+
 	insertLogs := storage.SortFieldBinlogs(binlogs)
 	if err := binlog.CompressFieldBinlogs(insertLogs); err != nil {
 		return nil, err
 	}
 
-	statsLogs := []*datapb.FieldBinlog{stats}
-	if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
-		return nil, err
+	var statsLogs []*datapb.FieldBinlog
+	if stats != nil {
+		statsLogs = []*datapb.FieldBinlog{stats}
+		if err := binlog.CompressFieldBinlogs(statsLogs); err != nil {
+			return nil, err
+		}
 	}
 
-	bm25StatsLogs := lo.Values(bm25stats)
-	if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
-		return nil, err
+	var bm25StatsLogs []*datapb.FieldBinlog
+	if len(bm25stats) > 0 {
+		bm25StatsLogs = lo.Values(bm25stats)
+		if err := binlog.CompressFieldBinlogs(bm25StatsLogs); err != nil {
+			return nil, err
+		}
 	}
 	compressCost := time.Since(phaseStart)
 
@@ -428,6 +449,41 @@ func (t *sortCompactionTask) Compact() (*datapb.CompactionPlanResult, error) {
 				State:  datapb.CompactionTaskState_failed,
 			}, nil
 		}
+		// For V3 segments, register text index stats in manifest.
+		// C++ Upload() returns relative file names; convert to absolute
+		// by prepending statsBasePath before registering with manifest.
+		if resultSegment.GetManifest() != "" && len(textStatsLogs) > 0 {
+			basePath, _, bErr := packed.UnmarshalManifestPath(resultSegment.GetManifest())
+			if bErr != nil {
+				log.Warn("failed to unmarshal manifest path for text index stats",
+					zap.Int64("targetSegmentID", targetSegemntID), zap.Error(bErr))
+				return &datapb.CompactionPlanResult{
+					PlanID: t.GetPlanID(),
+					State:  datapb.CompactionTaskState_failed,
+				}, nil
+			}
+			for _, stats := range textStatsLogs {
+				prefix := fmt.Sprintf("%s/_stats/text_index.%d", basePath, stats.GetFieldID())
+				for i, f := range stats.GetFiles() {
+					stats.Files[i] = prefix + "/" + f
+				}
+			}
+			statEntries := packed.TextIndexStatEntries(textStatsLogs, t.plan.GetCurrentScalarIndexVersion())
+			newManifest, mErr := packed.AddStatsToManifest(
+				resultSegment.GetManifest(), t.compactionParams.StorageConfig, statEntries)
+			if mErr != nil {
+				log.Warn("failed to add text index stats to manifest",
+					zap.Int64("targetSegmentID", targetSegemntID), zap.Error(mErr))
+				return &datapb.CompactionPlanResult{
+					PlanID: t.GetPlanID(),
+					State:  datapb.CompactionTaskState_failed,
+				}, nil
+			}
+			resultSegment.Manifest = newManifest
+			// Dual-write: V3 segments store text index stats in both manifest and segment metadata.
+			// Manifest is the source of truth at load time; metadata acts as a placeholder so that
+			// needDoTextIndex() in stats_inspector.go won't trigger a redundant TextIndexJob.
+		}
 		resultSegment.TextStatsLogs = textStatsLogs
 	}
 	createTextIndexCost := time.Since(stepStart)
@@ -553,6 +609,16 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 				return err
 			}
 
+			// Compute statsBasePath so C++ uploads text index to manifest-compatible location.
+			var statsBasePath string
+			if segment.GetManifest() != "" {
+				basePath, _, err := packed.UnmarshalManifestPath(segment.GetManifest())
+				if err != nil {
+					return fmt.Errorf("failed to unmarshal manifest path for text_index basePath: %w", err)
+				}
+				statsBasePath = fmt.Sprintf("%s/_stats/text_index.%d", basePath, field.GetFieldID())
+			}
+
 			buildIndexParams := &indexcgopb.BuildIndexInfo{
 				BuildID:                   t.GetPlanID(),
 				CollectionID:              collectionID,
@@ -562,9 +628,14 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 				InsertFiles:               files,
 				FieldSchema:               field,
 				StorageConfig:             newStorageConfig,
-				CurrentScalarIndexVersion: t.plan.GetCurrentScalarIndexVersion(),
+				CurrentScalarIndexVersion: common.ClampScalarIndexVersion(t.plan.GetCurrentScalarIndexVersion()),
 				StorageVersion:            t.storageVersion,
 				Manifest:                  segment.GetManifest(),
+				StatsBasePath:             statsBasePath,
+				IndexParams: []*commonpb.KeyValuePair{
+					{Key: "index_type", Value: "INVERTED"},
+					{Key: "is_text_match", Value: "true"},
+				},
 			}
 
 			if len(analyzerExtraInfo) > 0 {
@@ -579,9 +650,21 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 					partitionID,
 					segmentID)
 			}
-			uploaded, err := indexcgowrapper.CreateTextIndex(egCtx, buildIndexParams)
+
+			index, err := indexcgowrapper.CreateIndex(egCtx, buildIndexParams)
 			if err != nil {
 				return err
+			}
+			defer index.Delete()
+
+			indexStats, err := index.UpLoad()
+			if err != nil {
+				return err
+			}
+
+			uploaded := make(map[string]int64)
+			for _, info := range indexStats.GetSerializedIndexInfos() {
+				uploaded[info.FileName] = info.FileSize
 			}
 
 			mu.Lock()
@@ -593,7 +676,7 @@ func (t *sortCompactionTask) createTextIndex(ctx context.Context,
 				Files:                     lo.Keys(uploaded),
 				LogSize:                   totalSize,
 				MemorySize:                totalSize,
-				CurrentScalarIndexVersion: common.CurrentScalarIndexEngineVersion,
+				CurrentScalarIndexVersion: common.ClampScalarIndexVersion(t.plan.GetCurrentScalarIndexVersion()),
 			}
 			mu.Unlock()
 

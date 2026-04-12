@@ -9,7 +9,7 @@ default_flush_interval = 1
 big_flush_interval = 1000
 default_drop_interval = 3
 default_dim = 128
-default_nb = 2000
+default_nb = 3000
 default_nb_medium = 5000
 default_max_capacity = 100
 default_max_length = 500
@@ -297,6 +297,9 @@ all_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ",
                    "BIN_FLAT", "BIN_IVF_FLAT",
                    "SPARSE_INVERTED_INDEX", "SPARSE_WAND",
                    "GPU_IVF_FLAT", "GPU_IVF_PQ"]
+
+all_dense_float_index_types = ["FLAT", "IVF_FLAT", "IVF_SQ8", "IVF_PQ",
+                               "IVF_RABITQ", "HNSW", "SCANN", "DISKANN"]
 
 inverted_index_algo = ['TAAT_NAIVE', 'DAAT_WAND', 'DAAT_MAXSCORE']
 

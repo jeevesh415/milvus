@@ -24,6 +24,7 @@
 #include <iosfwd>
 #include <unordered_set>
 #include <variant>
+#include "segcore/default_fs.h"
 
 #include "NamedType/named_type_impl.hpp"
 #include "NamedType/underlying_functionalities.hpp"
@@ -57,6 +58,7 @@
 #include "nlohmann/json_fwd.hpp"
 #include "parquet/metadata.h"
 #include "segcore/storagev1translator/BsonInvertedIndexTranslator.h"
+#include "segcore/ChunkedSegmentSealedImpl.h"
 #include "segcore/storagev2translator/GroupChunkTranslator.h"
 #include "segcore/Utils.h"
 #include "storage/DiskFileManagerImpl.h"
@@ -118,8 +120,7 @@ JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
         auto trueFs = ctx.fs;
         // try singleton if possible
         if (!trueFs) {
-            trueFs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                         .GetArrowFileSystem();
+            trueFs = milvus::segcore::GetDefaultArrowFileSystem();
         }
         if (!trueFs) {
             ThrowInfo(ErrorCode::UnexpectedError, "Failed to get filesystem");
@@ -284,7 +285,7 @@ JsonKeyStats::CollectKeyInfo(const std::vector<FieldDataPtr>& field_datas,
     for (const auto& data : field_datas) {
         auto n = data->get_num_rows();
         for (int i = 0; i < n; i++) {
-            if (nullable && !data->is_valid(i)) {
+            if ((nullable || data->IsNullable()) && !data->is_valid(i)) {
                 continue;
             }
             auto json_str = static_cast<const milvus::Json*>(data->RawValue(i))
@@ -623,7 +624,7 @@ JsonKeyStats::BuildKeyStats(const std::vector<FieldDataPtr>& field_datas,
     for (const auto& data : field_datas) {
         auto n = data->get_num_rows();
         for (uint32_t i = 0; i < n; i++) {
-            if (nullable && !data->is_valid(i)) {
+            if ((nullable || data->IsNullable()) && !data->is_valid(i)) {
                 BuildKeyStatsForNullRow();
             } else {
                 auto json_str =
@@ -635,10 +636,9 @@ JsonKeyStats::BuildKeyStats(const std::vector<FieldDataPtr>& field_datas,
                 // should be handled as null row
                 if (strlen(json_str) == 0) {
                     BuildKeyStatsForNullRow();
-                    continue;
+                } else {
+                    BuildKeyStatsForRow(json_str, row_id);
                 }
-
-                BuildKeyStatsForRow(json_str, row_id);
             }
             row_id++;
         }
@@ -812,8 +812,7 @@ JsonKeyStats::BuildWithFieldData(const std::vector<FieldDataPtr>& field_datas,
 void
 JsonKeyStats::GetColumnSchemaFromParquet(int64_t column_group_id,
                                          const std::string& file) {
-    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                  .GetArrowFileSystem();
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
     AssertInfo(result.ok(),
                "[StorageV2] Failed to create file row group reader: {}",
@@ -876,8 +875,7 @@ JsonKeyStats::GetCommonMetaFromParquet(const std::string& file) {
              file,
              segment_id_);
 
-    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                  .GetArrowFileSystem();
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     auto result = milvus_storage::FileRowGroupReader::Make(fs, file);
     AssertInfo(result.ok(),
                "[StorageV2] Failed to create file row group reader: {}",
@@ -984,8 +982,7 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
             remote_prefix, column_group_id, file_id));
     }
 
-    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                  .GetArrowFileSystem();
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     auto result = milvus_storage::FileRowGroupReader::Make(fs, files[0]);
     AssertInfo(result.ok(),
                "[StorageV2] Failed to create file row group reader: {}",
@@ -1066,13 +1063,17 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
 
     auto& mmap_config = storage::MmapManager::GetInstance().GetMmapConfig();
 
+    auto group_chunk_metadata = milvus::segcore::LoadGroupChunkMetadata(
+        files, {}, fmt::format("seg_{}_jks_{}", segment_id_, field_id_));
+
     auto translator = std::make_unique<
         milvus::segcore::storagev2translator::GroupChunkTranslator>(
         segment_id_,
         GroupChunkType::JSON_KEY_STATS,
         field_meta_map,
         column_group_info,
-        files,
+        std::move(files),
+        std::move(group_chunk_metadata.row_group_meta_list),
         enable_mmap,
         mmap_config.GetMmapPopulate(),
         milvus_field_ids.size(),

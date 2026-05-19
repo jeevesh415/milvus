@@ -23,9 +23,9 @@ import (
 	"github.com/minio/minio-go/v7"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 var _ ObjectStorage = (*MinioObjectStorage)(nil)
@@ -57,7 +57,11 @@ func newMinioObjectStorageWithConfig(ctx context.Context, c *objectstorage.Confi
 func (minioObjectStorage *MinioObjectStorage) GetObject(ctx context.Context, bucketName, objectName string, offset int64, size int64) (FileReader, error) {
 	opts := minio.GetObjectOptions{}
 	if offset > 0 {
-		err := opts.SetRange(offset, offset+size-1)
+		end := int64(0)
+		if size > 0 {
+			end = offset + size - 1
+		}
+		err := opts.SetRange(offset, end)
 		if err != nil {
 			log.Warn("failed to set range", zap.String("bucket", bucketName), zap.String("path", objectName), zap.Error(err))
 			return nil, mapObjectStorageError(objectName, err)
@@ -87,7 +91,7 @@ func (minioObjectStorage *MinioObjectStorage) WalkWithObjects(ctx context.Contex
 	// recursive = true may timeout during the recursive browsing the objects.
 	// See also: https://github.com/milvus-io/milvus/issues/19095
 	// So we can change the `ListObjectsMaxKeys` to limit the max keys by batch to avoid timeout.
-	in := minioObjectStorage.Client.ListObjects(ctx, bucketName, minio.ListObjectsOptions{
+	in := minioObjectStorage.ListObjects(ctx, bucketName, minio.ListObjectsOptions{
 		Prefix:    prefix,
 		Recursive: recursive,
 		MaxKeys:   paramtable.Get().MinioCfg.ListObjectsMaxKeys.GetAsInt(),

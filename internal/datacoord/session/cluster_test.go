@@ -24,14 +24,14 @@ import (
 	"github.com/stretchr/testify/mock"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/mocks"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/workerpb"
-	"github.com/milvus-io/milvus/pkg/v2/taskcommon"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/workerpb"
+	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 )
 
 func init() {
@@ -218,6 +218,9 @@ func TestCluster_Compaction(t *testing.T) {
 					Segments: []*datapb.CompactionSegment{
 						{
 							SegmentID: 1,
+							Deltalogs: []*datapb.FieldBinlog{{
+								Binlogs: []*datapb.Binlog{{LogID: 10, LogPath: "files/insert_log/1/2/3/_delta/not-log-id-suffix"}},
+							}},
 						},
 					},
 				},
@@ -237,6 +240,7 @@ func TestCluster_Compaction(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, result)
 		assert.Equal(t, int64(1), result.PlanID)
+		assert.Equal(t, "files/insert_log/1/2/3/_delta/not-log-id-suffix", result.GetSegments()[0].GetDeltalogs()[0].GetBinlogs()[0].GetLogPath())
 	})
 
 	t.Run("drop compaction", func(t *testing.T) {

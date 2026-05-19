@@ -32,11 +32,11 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	_ "github.com/milvus-io/milvus/internal/storage/compress" // register a custom zstd codec here, to avoid to much memory usage when serializing.
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 var _ PayloadWriterInterface = (*NativePayloadWriter)(nil)
@@ -937,12 +937,12 @@ func (w *NativePayloadWriter) AddSparseFloatVectorToPayload(data *SparseFloatVec
 				validCount++
 			}
 		}
-		if len(data.SparseFloatArray.Contents) != validCount {
-			msg := fmt.Sprintf("when nullable, Contents length(%d) must equal to valid count(%d)", len(data.SparseFloatArray.Contents), validCount)
+		if len(data.Contents) != validCount {
+			msg := fmt.Sprintf("when nullable, Contents length(%d) must equal to valid count(%d)", len(data.Contents), validCount)
 			return merr.WrapErrParameterInvalidMsg(msg)
 		}
 	} else {
-		numRows = len(data.SparseFloatArray.Contents)
+		numRows = len(data.Contents)
 		if !w.nullable && len(data.ValidData) != 0 {
 			msg := fmt.Sprintf("length of validData(%d) must be 0 when not nullable", len(data.ValidData))
 			return merr.WrapErrParameterInvalidMsg(msg)
@@ -960,7 +960,7 @@ func (w *NativePayloadWriter) AddSparseFloatVectorToPayload(data *SparseFloatVec
 		if w.nullable && len(data.ValidData) > 0 && !data.ValidData[i] {
 			builder.AppendNull()
 		} else {
-			builder.Append(data.SparseFloatArray.Contents[dataIdx])
+			builder.Append(data.Contents[dataIdx])
 			dataIdx++
 		}
 	}
@@ -1222,19 +1222,22 @@ func (w *NativePayloadWriter) addFloatVectorArrayToPayload(builder *array.ListBu
 			return merr.WrapErrParameterInvalidMsg("expected FloatVector but got different type")
 		}
 
+		floatData := vectorField.GetFloatVector().GetData()
+
+		numVectors, err := validateVectorArrayElementCount(len(floatData), int(data.Dim))
+		if err != nil {
+			return err
+		}
+
 		// Start a new list for this row
 		builder.Append(true)
 
-		floatData := vectorField.GetFloatVector().GetData()
-
-		dim := vectorField.GetDim()
-		numVectors := len(floatData) / int(dim)
 		for i := 0; i < numVectors; i++ {
-			start := i * int(dim)
-			end := start + int(dim)
+			start := i * int(data.Dim)
+			end := start + int(data.Dim)
 			vectorSlice := floatData[start:end]
 
-			bytes := make([]byte, dim*4)
+			bytes := make([]byte, data.Dim*4)
 			for j, f := range vectorSlice {
 				binary.LittleEndian.PutUint32(bytes[j*4:], math.Float32bits(f))
 			}
@@ -1260,12 +1263,15 @@ func (w *NativePayloadWriter) addBinaryVectorArrayToPayload(builder *array.ListB
 			return merr.WrapErrParameterInvalidMsg("expected BinaryVector but got different type")
 		}
 
-		// Start a new list for this row
-		builder.Append(true)
-
 		binaryData := vectorField.GetBinaryVector()
 		byteWidth := (data.Dim + 7) / 8
-		numVectors := len(binaryData) / int(byteWidth)
+		numVectors, err := validateVectorArrayElementCount(len(binaryData), int(byteWidth))
+		if err != nil {
+			return err
+		}
+
+		// Start a new list for this row
+		builder.Append(true)
 
 		for i := 0; i < numVectors; i++ {
 			start := i * int(byteWidth)
@@ -1291,12 +1297,15 @@ func (w *NativePayloadWriter) addFloat16VectorArrayToPayload(builder *array.List
 			return merr.WrapErrParameterInvalidMsg("expected Float16Vector but got different type")
 		}
 
-		// Start a new list for this row
-		builder.Append(true)
-
 		float16Data := vectorField.GetFloat16Vector()
 		byteWidth := data.Dim * 2
-		numVectors := len(float16Data) / int(byteWidth)
+		numVectors, err := validateVectorArrayElementCount(len(float16Data), int(byteWidth))
+		if err != nil {
+			return err
+		}
+
+		// Start a new list for this row
+		builder.Append(true)
 
 		for i := 0; i < numVectors; i++ {
 			start := i * int(byteWidth)
@@ -1322,12 +1331,15 @@ func (w *NativePayloadWriter) addBFloat16VectorArrayToPayload(builder *array.Lis
 			return merr.WrapErrParameterInvalidMsg("expected BFloat16Vector but got different type")
 		}
 
-		// Start a new list for this row
-		builder.Append(true)
-
 		bfloat16Data := vectorField.GetBfloat16Vector()
 		byteWidth := data.Dim * 2
-		numVectors := len(bfloat16Data) / int(byteWidth)
+		numVectors, err := validateVectorArrayElementCount(len(bfloat16Data), int(byteWidth))
+		if err != nil {
+			return err
+		}
+
+		// Start a new list for this row
+		builder.Append(true)
 
 		for i := 0; i < numVectors; i++ {
 			start := i * int(byteWidth)
@@ -1353,11 +1365,14 @@ func (w *NativePayloadWriter) addInt8VectorArrayToPayload(builder *array.ListBui
 			return merr.WrapErrParameterInvalidMsg("expected Int8Vector but got different type")
 		}
 
+		int8Data := vectorField.GetInt8Vector()
+		numVectors, err := validateVectorArrayElementCount(len(int8Data), int(data.Dim))
+		if err != nil {
+			return err
+		}
+
 		// Start a new list for this row
 		builder.Append(true)
-
-		int8Data := vectorField.GetInt8Vector()
-		numVectors := len(int8Data) / int(data.Dim)
 
 		for i := 0; i < numVectors; i++ {
 			start := i * int(data.Dim)

@@ -51,9 +51,9 @@ jobs:
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
       - name: Setup Python environment
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '<3.12'
+          python-version: '3.12'
       - name: Install CMake 3.31.8
         run: |
           cmake --version || true
@@ -107,7 +107,7 @@ jobs:
           if [[ ! -d "${BREW_PREFIX}/opt/llvm" ]]; then
             ln -s ${BREW_PREFIX}/opt/llvm@17 ${BREW_PREFIX}/opt/llvm
           fi
-          pip3 install conan==1.66.0
+          pip3 install conan==2.25.1
           make milvus
       - name: Upload Cmake log
         uses: actions/upload-artifact@v4

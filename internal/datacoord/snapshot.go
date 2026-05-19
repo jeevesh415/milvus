@@ -27,12 +27,12 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/encoding/protojson"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus/internal/storage"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 )
 
 // S3 snapshot storage path constants.
@@ -61,7 +61,8 @@ const (
 	// Increment when making incompatible schema changes.
 	// Version 0: Legacy snapshots without version field (treated as version 1)
 	// Version 1: Initial version with format-version field in metadata
-	SnapshotFormatVersion = 1
+	// Version 2: Adds index_store_path_version to vector/scalar index files
+	SnapshotFormatVersion = 2
 )
 
 var (
@@ -71,6 +72,10 @@ var (
 	manifestSchema avro.Schema
 	// manifestSchemaErr stores any error that occurred during schema parsing.
 	manifestSchemaErr error
+
+	manifestSchemaV1Once sync.Once
+	manifestSchemaV1     avro.Schema
+	manifestSchemaV1Err  error
 )
 
 // getManifestSchema returns the cached Avro schema for manifest files.
@@ -83,12 +88,20 @@ func getManifestSchema() (avro.Schema, error) {
 	return manifestSchema, manifestSchemaErr
 }
 
+func getManifestSchemaV1() (avro.Schema, error) {
+	manifestSchemaV1Once.Do(func() {
+		manifestSchemaV1, manifestSchemaV1Err = avro.Parse(getAvroSchemaV1())
+	})
+	return manifestSchemaV1, manifestSchemaV1Err
+}
+
 // getManifestSchemaByVersion returns the Avro schema for the specified format version.
 // This function supports reading snapshots created with different schema versions.
 //
 // Version mapping:
-//   - Version 0, 1: Current schema (getProperAvroSchema)
-//   - Version 2+: Future schemas (to be added when needed)
+//   - Version 0, 1: Legacy schema without index_store_path_version
+//   - Version 2: Current schema with index_store_path_version
+//   - Version 3+: Future schemas (to be added when needed)
 //
 // When adding a new schema version:
 //  1. Create a new schema function (e.g., getAvroSchemaV2)
@@ -97,7 +110,9 @@ func getManifestSchema() (avro.Schema, error) {
 func getManifestSchemaByVersion(version int) (avro.Schema, error) {
 	switch version {
 	case 0, 1:
-		// Version 0 (legacy) and 1 use the same schema
+		// Version 0 (legacy) and 1 use the same schema.
+		return getManifestSchemaV1()
+	case 2:
 		return getManifestSchema()
 	default:
 		return nil, fmt.Errorf("unsupported manifest schema version: %d", version)
@@ -180,8 +195,8 @@ type ManifestEntry struct {
 	Bm25StatslogFiles []AvroFieldBinlog `avro:"bm25_statslog_files"`
 	// TextIndexFiles contains text index file information for full-text search.
 	TextIndexFiles []AvroTextIndexEntry `avro:"text_index_files"`
-	// JsonKeyIndexFiles contains JSON key index file information.
-	JsonKeyIndexFiles []AvroJsonKeyIndexEntry `avro:"json_key_index_files"`
+	// JSONKeyIndexFiles contains JSON key index file information.
+	JSONKeyIndexFiles []AvroJSONKeyIndexEntry `avro:"json_key_index_files"`
 	// StartPosition is the message queue position when segment was created.
 	StartPosition *AvroMsgPosition `avro:"start_position"`
 	// DmlPosition is the last consumed message queue position.
@@ -249,6 +264,8 @@ type AvroIndexFilePathInfo struct {
 	CurrentScalarIndexVersion int32 `avro:"current_scalar_index_version"`
 	// MemSize is the estimated memory consumption when loaded.
 	MemSize int64 `avro:"mem_size"`
+	// IndexStorePathVersion records the object-storage path layout used by these index files.
+	IndexStorePathVersion int32 `avro:"index_store_path_version"`
 }
 
 // AvroKeyValuePair represents commonpb.KeyValuePair in Avro-compatible format.
@@ -290,9 +307,9 @@ type AvroTextIndexStats struct {
 	CurrentScalarIndexVersion int32 `avro:"current_scalar_index_version"`
 }
 
-// AvroJsonKeyStats represents datapb.JsonKeyStats in Avro-compatible format.
+// AvroJSONKeyStats represents datapb.JsonKeyStats in Avro-compatible format.
 // Contains statistics and file paths for JSON key indexes.
-type AvroJsonKeyStats struct {
+type AvroJSONKeyStats struct {
 	// FieldID is the JSON field this index is built on.
 	FieldID int64 `avro:"field_id"`
 	// Version is the index version for tracking updates.
@@ -305,8 +322,8 @@ type AvroJsonKeyStats struct {
 	MemorySize int64 `avro:"memory_size"`
 	// BuildID is the index build task identifier.
 	BuildID int64 `avro:"build_id"`
-	// JsonKeyStatsDataFormat indicates the data format version.
-	JsonKeyStatsDataFormat int64 `avro:"json_key_stats_data_format"`
+	// JSONKeyStatsDataFormat indicates the data format version.
+	JSONKeyStatsDataFormat int64 `avro:"json_key_stats_data_format"`
 }
 
 // AvroTextIndexEntry wraps AvroTextIndexStats with its field ID.
@@ -319,13 +336,13 @@ type AvroTextIndexEntry struct {
 	Stats *AvroTextIndexStats `avro:"stats"`
 }
 
-// AvroJsonKeyIndexEntry wraps AvroJsonKeyStats with its field ID.
+// AvroJSONKeyIndexEntry wraps AvroJSONKeyStats with its field ID.
 // Similar to AvroTextIndexEntry, this converts map[int64]*JsonKeyStats to array format.
-type AvroJsonKeyIndexEntry struct {
+type AvroJSONKeyIndexEntry struct {
 	// FieldID is the map key (duplicated from Stats.FieldID for clarity).
 	FieldID int64 `avro:"field_id"`
 	// Stats contains the JSON key index statistics.
-	Stats *AvroJsonKeyStats `avro:"stats"`
+	Stats *AvroJSONKeyStats `avro:"stats"`
 }
 
 // =============================================================================
@@ -903,7 +920,7 @@ func (r *SnapshotReader) readManifestFile(ctx context.Context, filePath string, 
 	segment.TextIndexFiles = convertAvroToTextIndexMap(record.TextIndexFiles)
 
 	// Convert JSON key index files (array back to map)
-	segment.JsonKeyIndexFiles = convertAvroToJsonKeyIndexMap(record.JsonKeyIndexFiles)
+	segment.JsonKeyIndexFiles = convertAvroToJSONKeyIndexMap(record.JSONKeyIndexFiles)
 
 	return []*datapb.SegmentDescription{segment}, nil
 }
@@ -1021,7 +1038,7 @@ func convertSegmentToManifestEntry(segment *datapb.SegmentDescription) ManifestE
 	avroTextIndexFiles := convertTextIndexMapToAvro(segment.GetTextIndexFiles())
 
 	// Convert JSON key index map to Avro array format
-	avroJsonKeyIndexFiles := convertJsonKeyIndexMapToAvro(segment.GetJsonKeyIndexFiles())
+	avroJSONKeyIndexFiles := convertJSONKeyIndexMapToAvro(segment.GetJsonKeyIndexFiles())
 
 	// Assemble the ManifestEntry with all converted fields
 	return ManifestEntry{
@@ -1036,7 +1053,7 @@ func convertSegmentToManifestEntry(segment *datapb.SegmentDescription) ManifestE
 		StatslogFiles:     avroStatslogFiles,
 		Bm25StatslogFiles: avroBm25StatslogFiles,
 		TextIndexFiles:    avroTextIndexFiles,
-		JsonKeyIndexFiles: avroJsonKeyIndexFiles,
+		JSONKeyIndexFiles: avroJSONKeyIndexFiles,
 		StartPosition:     convertMsgPositionToAvro(segment.GetStartPosition()),
 		DmlPosition:       convertMsgPositionToAvro(segment.GetDmlPosition()),
 		StorageVersion:    segment.GetStorageVersion(),
@@ -1083,6 +1100,7 @@ func convertIndexFilePathInfoToAvro(info *indexpb.IndexFilePathInfo) AvroIndexFi
 		CurrentIndexVersion:       info.GetCurrentIndexVersion(),
 		CurrentScalarIndexVersion: info.GetCurrentScalarIndexVersion(),
 		MemSize:                   int64(info.GetMemSize()), // uint64 -> int64
+		IndexStorePathVersion:     int32(info.GetIndexStorePathVersion()),
 		IndexParams:               make([]AvroKeyValuePair, len(info.GetIndexParams())),
 	}
 
@@ -1138,6 +1156,7 @@ func convertAvroToIndexFilePathInfo(avroInfo AvroIndexFilePathInfo) *indexpb.Ind
 		CurrentIndexVersion:       avroInfo.CurrentIndexVersion,
 		CurrentScalarIndexVersion: avroInfo.CurrentScalarIndexVersion,
 		MemSize:                   uint64(avroInfo.MemSize), // int64 -> uint64
+		IndexStorePathVersion:     indexpb.IndexStorePathVersion(avroInfo.IndexStorePathVersion),
 	}
 
 	// Convert key-value parameters
@@ -1244,24 +1263,24 @@ func convertAvroToTextIndexMap(entries []AvroTextIndexEntry) map[int64]*datapb.T
 
 // --- JSON Key Index Conversion ---
 
-// convertJsonKeyStatsToAvro converts protobuf JsonKeyStats to Avro format.
-func convertJsonKeyStatsToAvro(stats *datapb.JsonKeyStats) *AvroJsonKeyStats {
+// convertJSONKeyStatsToAvro converts protobuf JsonKeyStats to Avro format.
+func convertJSONKeyStatsToAvro(stats *datapb.JsonKeyStats) *AvroJSONKeyStats {
 	if stats == nil {
 		return nil
 	}
-	return &AvroJsonKeyStats{
+	return &AvroJSONKeyStats{
 		FieldID:                stats.GetFieldID(),
 		Version:                stats.GetVersion(),
 		Files:                  stats.GetFiles(),
 		LogSize:                stats.GetLogSize(),
 		MemorySize:             stats.GetMemorySize(),
 		BuildID:                stats.GetBuildID(),
-		JsonKeyStatsDataFormat: stats.GetJsonKeyStatsDataFormat(),
+		JSONKeyStatsDataFormat: stats.GetJsonKeyStatsDataFormat(),
 	}
 }
 
-// convertAvroToJsonKeyStats converts Avro JsonKeyStats back to protobuf format.
-func convertAvroToJsonKeyStats(avroStats *AvroJsonKeyStats) *datapb.JsonKeyStats {
+// convertAvroToJSONKeyStats converts Avro JsonKeyStats back to protobuf format.
+func convertAvroToJSONKeyStats(avroStats *AvroJSONKeyStats) *datapb.JsonKeyStats {
 	if avroStats == nil {
 		return nil
 	}
@@ -1272,28 +1291,28 @@ func convertAvroToJsonKeyStats(avroStats *AvroJsonKeyStats) *datapb.JsonKeyStats
 		LogSize:                avroStats.LogSize,
 		MemorySize:             avroStats.MemorySize,
 		BuildID:                avroStats.BuildID,
-		JsonKeyStatsDataFormat: avroStats.JsonKeyStatsDataFormat,
+		JsonKeyStatsDataFormat: avroStats.JSONKeyStatsDataFormat,
 	}
 }
 
-// convertJsonKeyIndexMapToAvro converts protobuf map[int64]*JsonKeyStats to Avro array format.
+// convertJSONKeyIndexMapToAvro converts protobuf map[int64]*JsonKeyStats to Avro array format.
 // Avro doesn't support maps with non-string keys, so we convert to array of entries.
-func convertJsonKeyIndexMapToAvro(indexMap map[int64]*datapb.JsonKeyStats) []AvroJsonKeyIndexEntry {
-	var entries []AvroJsonKeyIndexEntry
+func convertJSONKeyIndexMapToAvro(indexMap map[int64]*datapb.JsonKeyStats) []AvroJSONKeyIndexEntry {
+	var entries []AvroJSONKeyIndexEntry
 	for fieldID, stats := range indexMap {
-		entries = append(entries, AvroJsonKeyIndexEntry{
+		entries = append(entries, AvroJSONKeyIndexEntry{
 			FieldID: fieldID,
-			Stats:   convertJsonKeyStatsToAvro(stats),
+			Stats:   convertJSONKeyStatsToAvro(stats),
 		})
 	}
 	return entries
 }
 
-// convertAvroToJsonKeyIndexMap converts Avro array back to protobuf map format.
-func convertAvroToJsonKeyIndexMap(entries []AvroJsonKeyIndexEntry) map[int64]*datapb.JsonKeyStats {
+// convertAvroToJSONKeyIndexMap converts Avro array back to protobuf map format.
+func convertAvroToJSONKeyIndexMap(entries []AvroJSONKeyIndexEntry) map[int64]*datapb.JsonKeyStats {
 	indexMap := make(map[int64]*datapb.JsonKeyStats)
 	for _, entry := range entries {
-		indexMap[entry.FieldID] = convertAvroToJsonKeyStats(entry.Stats)
+		indexMap[entry.FieldID] = convertAvroToJSONKeyStats(entry.Stats)
 	}
 	return indexMap
 }
@@ -1431,7 +1450,8 @@ func getProperAvroSchema() string {
 								{"name": "num_rows", "type": "long"},
 								{"name": "current_index_version", "type": "int"},
 								{"name": "mem_size", "type": "long"},
-								{"name": "current_scalar_index_version", "type": "int", "default": 0}
+								{"name": "current_scalar_index_version", "type": "int", "default": 0},
+								{"name": "index_store_path_version", "type": "int", "default": 0}
 							]
 						}
 					}
@@ -1470,14 +1490,14 @@ func getProperAvroSchema() string {
 						"type": "array",
 						"items": {
 							"type": "record",
-							"name": "AvroJsonKeyIndexEntry",
+							"name": "AvroJSONKeyIndexEntry",
 							"fields": [
 								{"name": "field_id", "type": "long"},
 								{
 									"name": "stats",
 									"type": {
 										"type": "record",
-										"name": "AvroJsonKeyStats",
+										"name": "AvroJSONKeyStats",
 										"fields": [
 											{"name": "field_id", "type": "long"},
 											{"name": "version", "type": "long"},
@@ -1495,4 +1515,12 @@ func getProperAvroSchema() string {
 				}
 			]
 	}`
+}
+
+func getAvroSchemaV1() string {
+	return strings.Replace(getProperAvroSchema(),
+		`,
+								{"name": "index_store_path_version", "type": "int", "default": 0}`,
+		"",
+		1)
 }

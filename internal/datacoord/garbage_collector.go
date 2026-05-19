@@ -30,23 +30,23 @@ import (
 	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/datacoord/broker"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/metastore/model"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/util/conc"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/metautil"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/conc"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // GcOption garbage collection options
@@ -139,12 +139,16 @@ func (gc *gcPauseRecords) Insert(ticket string, pauseUntil time.Time) error {
 			records = append(records, record)
 		}
 	}
+	gc.records = typeutil.NewObjectArrayBasedMaximumHeap(records, func(r gcPauseRecord) int64 {
+		return r.pauseUntil.UnixNano()
+	})
 
 	if gc.records.Len() < gc.maxLen {
 		gc.records.Push(gcPauseRecord{
 			ticket:     ticket,
 			pauseUntil: pauseUntil,
 		})
+		return nil
 	}
 
 	// too many pause records, refresh heap
@@ -220,10 +224,12 @@ func newGarbageCollector(meta *meta, handler Handler, opt GcOption) *garbageColl
 	ctx, cancel := context.WithCancel(context.Background())
 	metaSignal := make(chan gcCmd)
 	orphanSignal := make(chan gcCmd)
+	lobSignal := make(chan gcCmd)
 	// control signal channels
 	controlChannels := map[string]chan gcCmd{
 		"meta":   metaSignal,
 		"orphan": orphanSignal,
+		"lob":    lobSignal,
 	}
 	return &garbageCollector{
 		ctx:                   ctx,
@@ -322,7 +328,7 @@ func (gc *garbageCollector) Resume(ctx context.Context, collectionID int64, tick
 func (gc *garbageCollector) work(ctx context.Context) {
 	// TODO: fast cancel for gc when closing.
 	// Run gc tasks in parallel.
-	gc.wg.Add(3)
+	gc.wg.Add(4)
 	go func() {
 		defer gc.wg.Done()
 		gc.runRecycleTaskWithPauser(ctx, "meta", gc.option.checkInterval, func(ctx context.Context, signal <-chan gcCmd) {
@@ -334,7 +340,7 @@ func (gc *garbageCollector) work(ctx context.Context) {
 			gc.recycleUnusedTextIndexFiles(ctx, signal)
 			gc.recycleUnusedJSONIndexFiles(ctx, signal)
 			gc.recycleUnusedJSONStatsFiles(ctx, signal)
-			gc.recyclePendingSnapshots(ctx, signal) // Cleanup orphaned snapshot files from failed 2PC
+			gc.recycleSnapshots(ctx, signal)
 		})
 	}()
 	go func() {
@@ -342,7 +348,16 @@ func (gc *garbageCollector) work(ctx context.Context) {
 		gc.runRecycleTaskWithPauser(ctx, "orphan", gc.option.scanInterval, func(ctx context.Context, signal <-chan gcCmd) {
 			// orphan file not controlled by collection level pause for now
 			gc.recycleUnusedBinlogFiles(ctx)
-			gc.recycleUnusedIndexFiles(ctx)
+			gc.recycleUnusedIndexFilesV0(ctx)
+			gc.recycleUnusedIndexFilesV1(ctx)
+		})
+	}()
+	go func() {
+		defer gc.wg.Done()
+		// LOB (TEXT column) file GC runs on its own interval
+		lobCheckInterval := Params.DataCoordCfg.GCLOBCheckInterval.GetAsDuration(time.Second)
+		gc.runRecycleTaskWithPauser(ctx, "lob", lobCheckInterval, func(ctx context.Context, signal <-chan gcCmd) {
+			gc.recycleUnusedLOBFiles(ctx)
 		})
 	}()
 	go func() {
@@ -916,7 +931,7 @@ func (gc *garbageCollector) recycleChannelCPMeta(ctx context.Context, signal <-c
 		}
 
 		// Skip to GC if all segments meta of the corresponding collection are not removed
-		if gcConfirmed, _ := collectionID2GcStatus[collectionID]; !gcConfirmed {
+		if gcConfirmed := collectionID2GcStatus[collectionID]; !gcConfirmed {
 			skippedCnt++
 			continue
 		}
@@ -1113,13 +1128,15 @@ func (gc *garbageCollector) recycleUnusedSegIndexes(ctx context.Context, signal 
 	}
 }
 
-// recycleUnusedIndexFiles is used to delete those index files that no longer exist in the meta.
-func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
+// recycleUnusedIndexFilesV0 deletes orphan files under the legacy v0 index_files prefix.
+// v0 paths are rooted by buildID, so the first-level directory can be parsed and
+// checked against index meta directly.
+func (gc *garbageCollector) recycleUnusedIndexFilesV0(ctx context.Context) {
 	start := time.Now()
-	log := log.Ctx(ctx).With(zap.String("gcName", "recycleUnusedIndexFiles"), zap.Time("startAt", start))
-	log.Info("start recycleUnusedIndexFiles...")
+	log := log.Ctx(ctx).With(zap.String("gcName", "recycleUnusedIndexFilesV0"), zap.Time("startAt", start))
+	log.Info("start recycleUnusedIndexFilesV0...")
 
-	prefix := path.Join(gc.option.cli.RootPath(), common.SegmentIndexPath) + "/"
+	prefix := path.Join(gc.option.cli.RootPath(), common.SegmentIndexV0Path) + "/"
 
 	// Resolve snapshotMeta once. Both IsBuildIDGCBlocked paths below are O(1) so
 	// no caching of intermediate state is needed.
@@ -1132,9 +1149,11 @@ func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
 		keyCount++
 		logger := log.With(zap.String("prefix", prefix), zap.String("key", key))
 
+		// This recycler only walks index_files/ (v0). Its first path level is buildID;
+		// v1 collectionID directories live under index_v1/ and are handled below.
 		buildID, err := parseBuildIDFromFilePath(key)
 		if err != nil {
-			logger.Warn("garbageCollector recycleUnusedIndexFiles parseIndexFileKey", zap.Error(err))
+			logger.Warn("garbageCollector recycleUnusedIndexFilesV0 parseIndexFileKey", zap.Error(err))
 			return true
 		}
 		logger = logger.With(zap.Int64("buildID", buildID))
@@ -1147,7 +1166,7 @@ func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
 			return true
 		}
 		if segIdx == nil {
-			// buildID no longer exists in meta. Orphan buildID walk: no collection context,
+			// buildID no longer exists in meta. Orphan buildID walk has no collection context,
 			// so IsBuildIDGCBlocked(-1, buildID) fail-closes on ANY unloaded RefIndex globally.
 			if snapshotMeta != nil && snapshotMeta.IsBuildIDGCBlocked(-1, buildID) {
 				logger.Info("skip GC index files since buildID is protected by snapshot",
@@ -1156,13 +1175,13 @@ func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
 			}
 
 			// buildID no longer exists in meta, remove all index files
-			logger.Info("garbageCollector recycleUnusedIndexFiles find meta has not exist, remove index files")
+			logger.Info("garbageCollector recycleUnusedIndexFilesV0 find meta has not exist, remove index files")
 			err = gc.option.cli.RemoveWithPrefix(ctx, key)
 			if err != nil {
-				logger.Warn("garbageCollector recycleUnusedIndexFiles remove index files failed", zap.Error(err))
+				logger.Warn("garbageCollector recycleUnusedIndexFilesV0 remove index files failed", zap.Error(err))
 				return true
 			}
-			logger.Info("garbageCollector recycleUnusedIndexFiles remove index files success")
+			logger.Info("garbageCollector recycleUnusedIndexFilesV0 remove index files success")
 			return true
 		}
 
@@ -1190,14 +1209,14 @@ func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
 			if _, ok := filesMap[file]; !ok {
 				future := gc.option.removeObjectPool.Submit(func() (struct{}, error) {
 					logger := logger.With(zap.String("file", file))
-					logger.Info("garbageCollector recycleUnusedIndexFiles remove file...")
+					logger.Info("garbageCollector recycleUnusedIndexFilesV0 remove file...")
 
 					if err := gc.option.cli.Remove(ctx, file); err != nil {
-						logger.Warn("garbageCollector recycleUnusedIndexFiles remove file failed", zap.Error(err))
+						logger.Warn("garbageCollector recycleUnusedIndexFilesV0 remove file failed", zap.Error(err))
 						return struct{}{}, err
 					}
 					deletedFilesNum.Inc()
-					logger.Info("garbageCollector recycleUnusedIndexFiles remove file success")
+					logger.Info("garbageCollector recycleUnusedIndexFilesV0 remove file success")
 					return struct{}{}, nil
 				})
 				futures = append(futures, future)
@@ -1220,21 +1239,95 @@ func (gc *garbageCollector) recycleUnusedIndexFiles(ctx context.Context) {
 	})
 	log = log.With(zap.Duration("timeCost", time.Since(start)), zap.Int("keyCount", keyCount), zap.Error(err))
 	if err != nil {
-		log.Warn("garbageCollector recycleUnusedIndexFiles failed", zap.Error(err))
+		log.Warn("garbageCollector recycleUnusedIndexFilesV0 failed", zap.Error(err))
 		return
 	}
-	log.Info("recycleUnusedIndexFiles done")
+	log.Info("recycleUnusedIndexFilesV0 done")
 }
 
-// getAllIndexFilesOfIndex returns the all index files of index.
+// getAllIndexFilesOfIndex returns all expected index files using the path version
+// recorded on the SegmentIndex: v0 builds index_files paths, v1 builds index_v1 paths.
 func (gc *garbageCollector) getAllIndexFilesOfIndex(segmentIndex *model.SegmentIndex) map[string]struct{} {
+	builder := metautil.NewIndexPathBuilder(gc.option.cli.RootPath(),
+		segmentIndex.IndexStorePathVersion, segmentIndex.CollectionID,
+		segmentIndex.PartitionID, segmentIndex.SegmentID,
+		segmentIndex.BuildID, segmentIndex.IndexVersion)
 	filesMap := make(map[string]struct{})
 	for _, fileID := range segmentIndex.IndexFileKeys {
-		filepath := metautil.BuildSegmentIndexFilePath(gc.option.cli.RootPath(), segmentIndex.BuildID, segmentIndex.IndexVersion,
-			segmentIndex.PartitionID, segmentIndex.SegmentID, fileID)
-		filesMap[filepath] = struct{}{}
+		filesMap[builder.BuildFilePath(fileID)] = struct{}{}
 	}
 	return filesMap
+}
+
+// recycleUnusedIndexFilesV1 cleans index files for v1 format entries (collection-partitioned paths).
+// v1 uses the separate index_v1 prefix and puts collectionID before buildID,
+// so GC iterates deleted metadata entries instead of trying to parse buildID from a prefix walk.
+func (gc *garbageCollector) recycleUnusedIndexFilesV1(ctx context.Context) {
+	log := log.Ctx(ctx).With(zap.String("gcName", "recycleUnusedIndexFilesV1"))
+
+	snapshotMeta := gc.meta.GetSnapshotMeta()
+	deletedIndexes := gc.meta.indexMeta.GetDeletedIndexesWithV1Path()
+	if len(deletedIndexes) == 0 {
+		return
+	}
+
+	log.Info("start recycleUnusedIndexFilesV1", zap.Int("deletedCount", len(deletedIndexes)))
+	futures := make([]*conc.Future[struct{}], 0, len(deletedIndexes))
+	for _, segIdx := range deletedIndexes {
+		segIdx := segIdx
+		if snapshotMeta != nil && snapshotMeta.IsBuildIDGCBlocked(segIdx.CollectionID, segIdx.BuildID) {
+			log.Info("skip GC v1 index files since buildID is protected by snapshot",
+				zap.Int64("collectionID", segIdx.CollectionID),
+				zap.Int64("buildID", segIdx.BuildID))
+			continue
+		}
+
+		future := gc.option.removeObjectPool.Submit(func() (struct{}, error) {
+			builder := metautil.NewIndexPathBuilder(gc.option.cli.RootPath(),
+				segIdx.IndexStorePathVersion, segIdx.CollectionID,
+				segIdx.PartitionID, segIdx.SegmentID,
+				segIdx.BuildID, segIdx.IndexVersion)
+			prefix := builder.BuildPrefix() + "/"
+
+			if err := gc.option.cli.RemoveWithPrefix(ctx, prefix); err != nil {
+				log.Warn("recycleUnusedIndexFilesV1 remove failed",
+					zap.Int64("collectionID", segIdx.CollectionID),
+					zap.Int64("partitionID", segIdx.PartitionID),
+					zap.Int64("segmentID", segIdx.SegmentID),
+					zap.Int64("buildID", segIdx.BuildID),
+					zap.Int64("indexID", segIdx.IndexID),
+					zap.Stringer("pathVersion", segIdx.IndexStorePathVersion),
+					zap.String("prefix", prefix),
+					zap.Error(err))
+				return struct{}{}, err
+			}
+			if err := gc.meta.indexMeta.RemoveSegmentIndex(ctx, segIdx.BuildID); err != nil {
+				log.Warn("recycleUnusedIndexFilesV1 remove segment index meta failed",
+					zap.Int64("collectionID", segIdx.CollectionID),
+					zap.Int64("partitionID", segIdx.PartitionID),
+					zap.Int64("segmentID", segIdx.SegmentID),
+					zap.Int64("buildID", segIdx.BuildID),
+					zap.Int64("indexID", segIdx.IndexID),
+					zap.Stringer("pathVersion", segIdx.IndexStorePathVersion),
+					zap.String("prefix", prefix),
+					zap.Error(err))
+				return struct{}{}, err
+			}
+			log.Info("recycleUnusedIndexFilesV1 removed index files and meta",
+				zap.Int64("collectionID", segIdx.CollectionID),
+				zap.Int64("partitionID", segIdx.PartitionID),
+				zap.Int64("segmentID", segIdx.SegmentID),
+				zap.Int64("buildID", segIdx.BuildID),
+				zap.Int64("indexID", segIdx.IndexID),
+				zap.Stringer("pathVersion", segIdx.IndexStorePathVersion),
+				zap.String("prefix", prefix))
+			return struct{}{}, nil
+		})
+		futures = append(futures, future)
+	}
+	if err := conc.BlockOnAll(futures...); err != nil {
+		log.Warn("some task failure in remove object pool", zap.Error(err))
+	}
 }
 
 // recycleUnusedAnalyzeFiles is used to delete those analyze stats files that no longer exist in the meta.
@@ -1590,14 +1683,10 @@ func (gc *garbageCollector) recycleUnusedJSONIndexFiles(ctx context.Context, sig
 	metrics.GarbageCollectorRunCount.WithLabelValues(paramtable.GetStringNodeID()).Add(1)
 }
 
-// recyclePendingSnapshots cleans up orphaned snapshot files from failed 2PC commits.
-// This method scans etcd for PENDING snapshots that have exceeded the timeout,
-// computes their S3 directory/file paths from snapshot ID, and cleans up using RemoveWithPrefix.
-//
-// Key design decisions:
-//   - NO S3 list operations: Uses RemoveWithPrefix for directory cleanup
-//   - File paths computed from collection_id + snapshot_id stored in etcd
-//   - Timeout mechanism prevents cleanup of snapshots still being created
+// recycleSnapshots cleans up snapshot resources in three phases:
+//  1. PENDING snapshots: Failed 2PC commits that exceeded timeout — clean S3 + catalog.
+//  2. DELETING snapshots: DropSnapshot succeeded but S3 cleanup failed — retry S3 + catalog.
+//  3. Orphan snapshots: Snapshots whose collection was dropped — clean expired pins, then drop.
 //
 // Process flow:
 //  1. Get all PENDING snapshots from catalog that have exceeded timeout.
@@ -1612,15 +1701,15 @@ func (gc *garbageCollector) recycleUnusedJSONIndexFiles(ctx context.Context, sig
 //     delete the catalog record. This keeps the snapshot eligible for retry in
 //     the next GC cycle, ensuring we do not lose the ability to clean up S3
 //     artifacts.
-func (gc *garbageCollector) recyclePendingSnapshots(ctx context.Context, signal <-chan gcCmd) {
+func (gc *garbageCollector) recycleSnapshots(ctx context.Context, signal <-chan gcCmd) {
 	start := time.Now()
-	log := log.Ctx(ctx).With(zap.String("gcName", "recyclePendingSnapshots"), zap.Time("startAt", start))
-	log.Info("start recyclePendingSnapshots...")
-	defer func() { log.Info("recyclePendingSnapshots done", zap.Duration("timeCost", time.Since(start))) }()
+	log := log.Ctx(ctx).With(zap.String("gcName", "recycleSnapshots"), zap.Time("startAt", start))
+	log.Info("start recycleSnapshots...")
+	defer func() { log.Info("recycleSnapshots done", zap.Duration("timeCost", time.Since(start))) }()
 
 	snapshotMeta := gc.meta.GetSnapshotMeta()
 	if snapshotMeta == nil {
-		log.Warn("snapshotMeta is nil, skip recyclePendingSnapshots")
+		log.Warn("snapshotMeta is nil, skip recycleSnapshots")
 		return
 	}
 
@@ -1634,60 +1723,58 @@ func (gc *garbageCollector) recyclePendingSnapshots(ctx context.Context, signal 
 		return
 	}
 
-	if len(pendingSnapshots) == 0 {
-		return
+	if len(pendingSnapshots) > 0 {
+		log.Info("found pending snapshots to cleanup", zap.Int("count", len(pendingSnapshots)))
+		cleanedCount := 0
+
+		for _, snapshot := range pendingSnapshots {
+			snapshotLog := log.With(
+				zap.String("snapshotName", snapshot.GetName()),
+				zap.Int64("snapshotID", snapshot.GetId()),
+				zap.Int64("collectionID", snapshot.GetCollectionId()),
+			)
+
+			gc.ackSignal(signal)
+			// Compute paths from collection_id + snapshot_id
+			manifestDir, metadataPath := GetSnapshotPaths(
+				gc.option.cli.RootPath(),
+				snapshot.GetCollectionId(),
+				snapshot.GetId(),
+			)
+
+			snapshotLog.Info("cleaning up pending snapshot",
+				zap.String("manifestDir", manifestDir),
+				zap.String("metadataPath", metadataPath))
+
+			// Delete manifest directory using RemoveWithPrefix (no list needed)
+			// This removes all segment manifest files: manifests/{snapshot_id}/*.avro
+			if err := gc.option.cli.RemoveWithPrefix(ctx, manifestDir); err != nil {
+				snapshotLog.Warn("failed to remove pending snapshot manifest directory", zap.Error(err))
+				// Keep catalog record for retry in next GC cycle.
+				continue
+			}
+
+			// Delete metadata file
+			if err := gc.option.cli.Remove(ctx, metadataPath); err != nil {
+				snapshotLog.Warn("failed to remove pending snapshot metadata file", zap.Error(err))
+				// Keep catalog record for retry in next GC cycle.
+				continue
+			}
+
+			// Delete etcd record
+			if err := snapshotMeta.CleanupPendingSnapshot(ctx, snapshot); err != nil {
+				snapshotLog.Warn("failed to drop pending snapshot from catalog", zap.Error(err))
+				continue
+			}
+
+			snapshotLog.Info("successfully cleaned up pending snapshot")
+			cleanedCount++
+		}
+
+		log.Info("pending snapshots cleanup completed",
+			zap.Int("totalPending", len(pendingSnapshots)),
+			zap.Int("cleanedCount", cleanedCount))
 	}
-
-	log.Info("found pending snapshots to cleanup", zap.Int("count", len(pendingSnapshots)))
-	cleanedCount := 0
-
-	for _, snapshot := range pendingSnapshots {
-		snapshotLog := log.With(
-			zap.String("snapshotName", snapshot.GetName()),
-			zap.Int64("snapshotID", snapshot.GetId()),
-			zap.Int64("collectionID", snapshot.GetCollectionId()),
-		)
-
-		gc.ackSignal(signal)
-		// Compute paths from collection_id + snapshot_id
-		manifestDir, metadataPath := GetSnapshotPaths(
-			gc.option.cli.RootPath(),
-			snapshot.GetCollectionId(),
-			snapshot.GetId(),
-		)
-
-		snapshotLog.Info("cleaning up pending snapshot",
-			zap.String("manifestDir", manifestDir),
-			zap.String("metadataPath", metadataPath))
-
-		// Delete manifest directory using RemoveWithPrefix (no list needed)
-		// This removes all segment manifest files: manifests/{snapshot_id}/*.avro
-		if err := gc.option.cli.RemoveWithPrefix(ctx, manifestDir); err != nil {
-			snapshotLog.Warn("failed to remove pending snapshot manifest directory", zap.Error(err))
-			// Keep catalog record for retry in next GC cycle.
-			continue
-		}
-
-		// Delete metadata file
-		if err := gc.option.cli.Remove(ctx, metadataPath); err != nil {
-			snapshotLog.Warn("failed to remove pending snapshot metadata file", zap.Error(err))
-			// Keep catalog record for retry in next GC cycle.
-			continue
-		}
-
-		// Delete etcd record
-		if err := snapshotMeta.CleanupPendingSnapshot(ctx, snapshot); err != nil {
-			snapshotLog.Warn("failed to drop pending snapshot from catalog", zap.Error(err))
-			continue
-		}
-
-		snapshotLog.Info("successfully cleaned up pending snapshot")
-		cleanedCount++
-	}
-
-	log.Info("pending snapshots cleanup completed",
-		zap.Int("totalPending", len(pendingSnapshots)),
-		zap.Int("cleanedCount", cleanedCount))
 
 	// Clean up DELETING snapshots (two-phase delete cleanup)
 	// These are snapshots that were marked for deletion but S3 cleanup failed
@@ -1743,6 +1830,72 @@ func (gc *garbageCollector) recyclePendingSnapshots(ctx context.Context, signal 
 		log.Info("deleting snapshots cleanup completed",
 			zap.Int("totalDeleting", len(deletingSnapshots)),
 			zap.Int("cleanedCount", deletingCleanedCount))
+	}
+
+	// GC fallback: Two responsibilities per collection:
+	//   1. For EVERY collection with snapshot records, reap expired pin entries
+	//      from SnapshotInfo to bound etcd storage growth. Orphan pins
+	//      (crashed restores, swallowed Unpin errors) would otherwise accumulate
+	//      forever since Pin/Unpin only touch their own entries.
+	//   2. For collections whose owning collection was DROPPED, cascade-delete
+	//      the orphan snapshots. Handles the case where the drop-collection
+	//      cascade callback failed to fully clean up.
+	activeCollectionIDs := snapshotMeta.GetActiveCollectionIDs()
+
+	if len(activeCollectionIDs) > 0 {
+		orphanCleanedCount := 0
+		for _, collectionID := range activeCollectionIDs {
+			gc.ackSignal(signal)
+
+			if ctx.Err() != nil {
+				log.Warn("context canceled, stop snapshot cleanup")
+				break
+			}
+
+			// Step 1: reap expired pins regardless of collection liveness.
+			for _, r := range snapshotMeta.cleanExpiredPinsForCollection(ctx, collectionID) {
+				setSnapshotActivePinsGauge(r.CollectionID, r.SnapshotName, r.ActivePins)
+			}
+
+			// Step 2: if the collection was dropped, cascade-delete orphan snapshots.
+			timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			has, err := gc.option.broker.HasCollection(timeoutCtx, collectionID)
+			cancel()
+			if err != nil {
+				log.Warn("failed to check collection existence for orphan snapshot cleanup",
+					zap.Int64("collectionID", collectionID),
+					zap.Error(err))
+				continue
+			}
+			if has {
+				// Collection still exists, not an orphan — expired pins already reaped above.
+				continue
+			}
+
+			log.Info("found orphan snapshots for dropped collection, cleaning up",
+				zap.Int64("collectionID", collectionID))
+
+			dropped, err := snapshotMeta.DropSnapshotsByCollection(ctx, collectionID)
+			for _, n := range dropped {
+				setSnapshotActivePinsGauge(collectionID, n, 0)
+			}
+			if err != nil {
+				log.Warn("failed to drop orphan snapshots for collection",
+					zap.Int64("collectionID", collectionID),
+					zap.Error(err))
+				continue
+			}
+
+			log.Info("successfully cleaned up orphan snapshots for dropped collection",
+				zap.Int64("collectionID", collectionID))
+			orphanCleanedCount++
+		}
+
+		if orphanCleanedCount > 0 {
+			log.Info("orphan snapshots cleanup completed",
+				zap.Int("totalOrphanCollections", len(activeCollectionIDs)),
+				zap.Int("cleanedCount", orphanCleanedCount))
+		}
 	}
 
 	metrics.GarbageCollectorRunCount.WithLabelValues(paramtable.GetStringNodeID()).Add(1)

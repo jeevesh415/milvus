@@ -25,21 +25,21 @@ import (
 	"github.com/samber/lo"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/querycoordv2/params"
 	"github.com/milvus-io/milvus/internal/querycoordv2/session"
 	"github.com/milvus-io/milvus/internal/querycoordv2/utils"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/lock"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/lock"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type targetOp int
@@ -61,6 +61,7 @@ const (
 	UpdateCollection targetOp = iota + 1
 	ReleaseCollection
 	ReleasePartition
+	UpdatePartition
 )
 
 type targetUpdateRequest struct {
@@ -243,6 +244,39 @@ func (ob *TargetObserver) schedule(ctx context.Context) {
 				ob.targetMgr.RemovePartitionFromNextTarget(ctx, req.CollectionID, req.PartitionIDs...)
 				ob.keylocks.Unlock(req.CollectionID)
 				req.Notifier <- nil
+			case UpdatePartition:
+				// Fast path: check with read lock first
+				ob.keylocks.RLock(req.CollectionID)
+				exists := ob.targetMgr.IsCurrentTargetExist(ctx, req.CollectionID, req.PartitionIDs[0])
+				ob.keylocks.RUnlock(req.CollectionID)
+
+				if exists {
+					close(req.ReadyNotifier)
+					req.Notifier <- nil
+				} else {
+					// Slow path: need to update next target
+					ob.keylocks.Lock(req.CollectionID)
+					// Double check after acquiring write lock
+					if ob.targetMgr.IsCurrentTargetExist(ctx, req.CollectionID, req.PartitionIDs[0]) {
+						close(req.ReadyNotifier)
+						req.Notifier <- nil
+					} else {
+						err := ob.updateNextTarget(ctx, req.CollectionID)
+						if err != nil {
+							log.Warn("failed to manually update next target",
+								zap.Int64("collectionID", req.CollectionID),
+								zap.String("opType", req.opType.String()),
+								zap.Error(err))
+							close(req.ReadyNotifier)
+						} else {
+							ob.mut.Lock()
+							ob.readyNotifiers[req.CollectionID] = append(ob.readyNotifiers[req.CollectionID], req.ReadyNotifier)
+							ob.mut.Unlock()
+						}
+						req.Notifier <- err
+					}
+					ob.keylocks.Unlock(req.CollectionID)
+				}
 			}
 			log.Info("manually trigger update target done",
 				zap.Int64("collectionID", req.CollectionID),
@@ -270,7 +304,7 @@ func (ob *TargetObserver) check(ctx context.Context, collectionID int64) {
 	defer ob.keylocks.Unlock(collectionID)
 
 	// if collection release, skip check
-	if ob.meta.CollectionManager.GetCollection(ctx, collectionID) == nil {
+	if ob.meta.GetCollection(ctx, collectionID) == nil {
 		return
 	}
 
@@ -318,6 +352,20 @@ func (ob *TargetObserver) UpdateNextTarget(collectionID int64) (chan struct{}, e
 	ob.updateChan <- targetUpdateRequest{
 		CollectionID:  collectionID,
 		opType:        UpdateCollection,
+		Notifier:      notifier,
+		ReadyNotifier: readyCh,
+	}
+	return readyCh, <-notifier
+}
+
+func (ob *TargetObserver) UpdatePartition(collectionID int64, partitionID int64) (chan struct{}, error) {
+	notifier := make(chan error)
+	readyCh := make(chan struct{})
+	defer close(notifier)
+	ob.updateChan <- targetUpdateRequest{
+		CollectionID:  collectionID,
+		PartitionIDs:  []int64{partitionID},
+		opType:        UpdatePartition,
 		Notifier:      notifier,
 		ReadyNotifier: readyCh,
 	}
@@ -401,7 +449,7 @@ func (ob *TargetObserver) updateNextTargetTimestamp(collectionID int64) {
 }
 
 func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collectionID int64) bool {
-	replicaNum := ob.meta.CollectionManager.GetReplicaNumber(ctx, collectionID)
+	replicaNum := ob.meta.GetReplicaNumber(ctx, collectionID)
 	log := log.Ctx(ctx).WithRateGroup(
 		fmt.Sprintf("qcv2.TargetObserver-shouldUpdateCurrentTarget-%d", collectionID),
 		10,
@@ -449,7 +497,7 @@ func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collect
 	// This prevents the issue where some replicas may lack nodes during dynamic replica scaling,
 	// while the total count still meets the threshold.
 	readyDelegatorsInCollection := make([]*meta.DmChannel, 0)
-	replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
+	replicas := ob.meta.GetByCollection(ctx, collectionID)
 	for _, replica := range replicas {
 		readyDelegatorsInReplica := make([]*meta.DmChannel, 0)
 		for channel := range channelNames {
@@ -466,14 +514,16 @@ func (ob *TargetObserver) shouldUpdateCurrentTarget(ctx context.Context, collect
 		readyDelegatorsInCollection = append(readyDelegatorsInCollection, readyDelegatorsInReplica...)
 	}
 
-	// segment data satisfies next target spec
-	segmentDataReady := !paramtable.Get().QueryCoordCfg.UpdateTargetNeedSegmentDataReady.GetAsBool() ||
-		utils.CheckSegmentDataReady(ctx, collectionID, ob.distMgr, ob.targetMgr, meta.NextTarget) == nil
-
 	syncSuccess := ob.syncNextTargetToDelegator(ctx, collectionID, readyDelegatorsInCollection, newVersion)
 	syncedChannelNames := lo.Uniq(lo.Map(readyDelegatorsInCollection, func(ch *meta.DmChannel, _ int) string { return ch.ChannelName }))
 	// only after all channel are synced, we can consider the current target is ready
-	return syncSuccess && lo.Every(syncedChannelNames, lo.Keys(channelNames)) && segmentDataReady
+	if !syncSuccess || !lo.Every(syncedChannelNames, lo.Keys(channelNames)) {
+		return false
+	}
+
+	// segment data satisfies next target spec
+	return !paramtable.Get().QueryCoordCfg.UpdateTargetNeedSegmentDataReady.GetAsBool() ||
+		utils.CheckSegmentDataReady(ctx, collectionID, ob.distMgr, ob.targetMgr, meta.NextTarget) == nil
 }
 
 // sync next target info to delegator as readable snapshot
@@ -485,7 +535,7 @@ func (ob *TargetObserver) syncNextTargetToDelegator(ctx context.Context, collect
 	var err error
 	for _, d := range collReadyDelegatorList {
 		updateVersionAction := ob.genSyncAction(ctx, d.View, newVersion)
-		replica := ob.meta.ReplicaManager.GetByCollectionAndNode(ctx, collectionID, d.Node)
+		replica := ob.meta.GetByCollectionAndNode(ctx, collectionID, d.Node)
 		if replica == nil {
 			log.Warn("replica not found", zap.Int64("nodeID", d.Node), zap.Int64("collectionID", collectionID))
 			// should not happen, don't update current target if replica not found
@@ -607,7 +657,7 @@ func (ob *TargetObserver) updateAllReplicasCheckpointMetric(ctx context.Context,
 	if currentVersion == 0 {
 		return
 	}
-	replicas := ob.meta.ReplicaManager.GetByCollection(ctx, collectionID)
+	replicas := ob.meta.GetByCollection(ctx, collectionID)
 	if len(replicas) == 0 {
 		return
 	}

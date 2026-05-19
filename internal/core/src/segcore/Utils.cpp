@@ -10,6 +10,7 @@
 // or implied. See the License for the specific language governing permissions and limitations under the License
 
 #include "segcore/Utils.h"
+#include "segcore/default_fs.h"
 
 #include <cxxabi.h>
 #include <folly/ExceptionWrapper.h>
@@ -500,11 +501,13 @@ CreateEmptyVectorDataArray(int64_t count, const FieldMeta& field_meta) {
         }
         case DataType::VECTOR_ARRAY: {
             auto obj = vector_array->mutable_vector_array();
+            obj->set_dim(dim);
             obj->set_element_type(static_cast<milvus::proto::schema::DataType>(
                 field_meta.get_element_type()));
             obj->mutable_data()->Reserve(count);
             for (int i = 0; i < count; i++) {
-                *(obj->mutable_data()->Add()) = proto::schema::VectorField();
+                auto* row = obj->mutable_data()->Add();
+                row->set_dim(dim);
             }
             break;
         }
@@ -521,7 +524,8 @@ CreateEmptyVectorDataArray(int64_t count,
                            int64_t valid_count,
                            const void* valid_data,
                            const FieldMeta& field_meta) {
-    int64_t data_count = (field_meta.is_nullable() && valid_data != nullptr)
+    int64_t data_count = (field_meta.is_nullable() && valid_data != nullptr &&
+                          field_meta.get_data_type() != DataType::VECTOR_ARRAY)
                              ? valid_count
                              : count;
     auto data_array = CreateEmptyVectorDataArray(data_count, field_meta);
@@ -1480,8 +1484,7 @@ LoadIndexData(milvus::tracer::TraceContext& ctx,
     auto remote_chunk_manager =
         milvus::storage::RemoteChunkManagerSingleton::GetInstance()
             .GetRemoteChunkManager();
-    auto fs = milvus_storage::ArrowFileSystemSingleton::GetInstance()
-                  .GetArrowFileSystem();
+    auto fs = milvus::segcore::GetDefaultArrowFileSystem();
     AssertInfo(fs != nullptr, "arrow file system is nullptr");
     milvus::storage::FileManagerContext file_manager_context(
         field_meta, index_meta, remote_chunk_manager, fs);

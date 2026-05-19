@@ -24,17 +24,19 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/datacoord/session"
 	"github.com/milvus-io/milvus/internal/datacoord/task"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/metrics"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/taskcommon"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/taskcommon"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // Copy Segment Task Management
@@ -521,7 +523,7 @@ func AssembleCopySegmentRequest(task CopySegmentTask, job CopySegmentJob) (*data
 	ctx := context.Background()
 
 	// Read complete snapshot data from S3 to retrieve source segment binlogs
-	snapshotData, err := t.snapshotMeta.ReadSnapshotData(ctx, job.GetSnapshotName(), true)
+	snapshotData, err := t.snapshotMeta.ReadSnapshotData(ctx, job.GetSourceCollectionId(), job.GetSnapshotName(), true)
 	if err != nil {
 		log.Error("failed to read snapshot data for copy segment task",
 			append(WrapCopySegmentTaskLog(task), zap.Error(err))...)
@@ -538,6 +540,11 @@ func AssembleCopySegmentRequest(task CopySegmentTask, job CopySegmentJob) (*data
 	idMappings := task.GetIdMappings()
 	sources := make([]*datapb.CopySegmentSource, 0, len(idMappings))
 	targets := make([]*datapb.CopySegmentTarget, 0, len(idMappings))
+	var sourceSchema *schemapb.CollectionSchema
+	if snapshotData.Collection != nil {
+		sourceSchema = snapshotData.Collection.GetSchema()
+	}
+	isExternalCollection := typeutil.IsExternalCollection(sourceSchema)
 
 	for _, mapping := range idMappings {
 		sourceSegID := mapping.GetSourceSegmentId()
@@ -553,18 +560,19 @@ func AssembleCopySegmentRequest(task CopySegmentTask, job CopySegmentJob) (*data
 
 		// Build source with full binlog information
 		source := &datapb.CopySegmentSource{
-			CollectionId:      snapshotData.SnapshotInfo.GetCollectionId(),
-			PartitionId:       sourceSegDesc.GetPartitionId(),
-			SegmentId:         sourceSegDesc.GetSegmentId(),
-			InsertBinlogs:     sourceSegDesc.GetBinlogs(),
-			StatsBinlogs:      sourceSegDesc.GetStatslogs(),
-			DeltaBinlogs:      sourceSegDesc.GetDeltalogs(),
-			IndexFiles:        sourceSegDesc.GetIndexFiles(),        // vector/scalar index file info
-			Bm25Binlogs:       sourceSegDesc.GetBm25Statslogs(),     // BM25 stats logs
-			TextIndexFiles:    sourceSegDesc.GetTextIndexFiles(),    // Text index files
-			JsonKeyIndexFiles: sourceSegDesc.GetJsonKeyIndexFiles(), // JSON key index files
-			ManifestPath:      sourceSegDesc.GetManifestPath(),      // manifest path for StorageV3+
-			StorageVersion:    sourceSegDesc.GetStorageVersion(),    // storage version for binlog format decision
+			CollectionId:         snapshotData.SnapshotInfo.GetCollectionId(),
+			PartitionId:          sourceSegDesc.GetPartitionId(),
+			SegmentId:            sourceSegDesc.GetSegmentId(),
+			InsertBinlogs:        sourceSegDesc.GetBinlogs(),
+			StatsBinlogs:         sourceSegDesc.GetStatslogs(),
+			DeltaBinlogs:         sourceSegDesc.GetDeltalogs(),
+			IndexFiles:           sourceSegDesc.GetIndexFiles(),        // vector/scalar index file info
+			Bm25Binlogs:          sourceSegDesc.GetBm25Statslogs(),     // BM25 stats logs
+			TextIndexFiles:       sourceSegDesc.GetTextIndexFiles(),    // Text index files
+			JsonKeyIndexFiles:    sourceSegDesc.GetJsonKeyIndexFiles(), // JSON key index files
+			ManifestPath:         sourceSegDesc.GetManifestPath(),      // manifest path for StorageV3+
+			StorageVersion:       sourceSegDesc.GetStorageVersion(),    // storage version for binlog format decision
+			IsExternalCollection: isExternalCollection,
 		}
 		sources = append(sources, source)
 
@@ -675,7 +683,6 @@ func SyncCopySegmentTask(task CopySegmentTask, resp *datapb.QueryCopySegmentResp
 	case datapb.CopySegmentTaskState_CopySegmentTaskCompleted:
 		// Update binlog information for all segments
 		for _, result := range resp.GetSegmentResults() {
-
 			// Update binlog info and segment state to Flushed
 			// For StorageV3+ segments, also update manifest_path
 			var err error
@@ -721,7 +728,7 @@ func SyncCopySegmentTask(task CopySegmentTask, resp *datapb.QueryCopySegmentResp
 			}
 
 			// Sync JSON key indexes
-			if err = syncJsonKeyIndexes(ctx, result, task, meta, copyMeta); err != nil {
+			if err = syncJSONKeyIndexes(ctx, result, task, meta, copyMeta); err != nil {
 				return err
 			}
 
@@ -845,6 +852,7 @@ func syncVectorScalarIndexes(ctx context.Context, result *datapb.CopySegmentResu
 			CreatedUTCTime:            uint64(now),
 			FinishedUTCTime:           uint64(now),
 			NumRows:                   result.GetImportedRows(),
+			IndexStorePathVersion:     indexInfo.GetIndexStorePathVersion(),
 		}
 
 		err := meta.indexMeta.AddSegmentIndex(ctx, segIndex)
@@ -957,7 +965,7 @@ func syncTextIndexes(ctx context.Context, result *datapb.CopySegmentResult,
 // Index Synchronization: JSON Key Indexes
 // ===========================================================================================
 
-// syncJsonKeyIndexes synchronizes JSON key index metadata to segment.
+// syncJSONKeyIndexes synchronizes JSON key index metadata to segment.
 //
 // Process flow:
 //  1. Update segment with JSON key index logs
@@ -978,7 +986,7 @@ func syncTextIndexes(ctx context.Context, result *datapb.CopySegmentResult,
 // - Indexes on keys within JSON fields
 // - Stored inline with segment metadata (not in indexMeta)
 // - Enables efficient queries on JSON field contents
-func syncJsonKeyIndexes(ctx context.Context, result *datapb.CopySegmentResult,
+func syncJSONKeyIndexes(ctx context.Context, result *datapb.CopySegmentResult,
 	task CopySegmentTask, meta *meta, copyMeta CopySegmentMeta,
 ) error {
 	if len(result.GetJsonKeyIndexInfos()) == 0 {
@@ -986,7 +994,7 @@ func syncJsonKeyIndexes(ctx context.Context, result *datapb.CopySegmentResult,
 	}
 
 	err := meta.UpdateSegment(result.GetSegmentId(),
-		SetJsonKeyIndexLogs(result.GetJsonKeyIndexInfos()))
+		SetJSONKeyIndexLogs(result.GetJsonKeyIndexInfos()))
 	if err != nil {
 		log.Warn("failed to update json key index",
 			WrapCopySegmentTaskLog(task,

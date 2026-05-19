@@ -8,10 +8,10 @@ package datapb
 
 import (
 	context "context"
-	commonpb "github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	milvuspb "github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	indexpb "github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	internalpb "github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
+	commonpb "github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	milvuspb "github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	indexpb "github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	internalpb "github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	grpc "google.golang.org/grpc"
 	codes "google.golang.org/grpc/codes"
 	status "google.golang.org/grpc/status"
@@ -77,7 +77,10 @@ const (
 	DataCoord_RestoreSnapshot_FullMethodName                      = "/milvus.proto.data.DataCoord/RestoreSnapshot"
 	DataCoord_GetRestoreSnapshotState_FullMethodName              = "/milvus.proto.data.DataCoord/GetRestoreSnapshotState"
 	DataCoord_ListRestoreSnapshotJobs_FullMethodName              = "/milvus.proto.data.DataCoord/ListRestoreSnapshotJobs"
+	DataCoord_PinSnapshotData_FullMethodName                      = "/milvus.proto.data.DataCoord/PinSnapshotData"
+	DataCoord_UnpinSnapshotData_FullMethodName                    = "/milvus.proto.data.DataCoord/UnpinSnapshotData"
 	DataCoord_BatchUpdateManifest_FullMethodName                  = "/milvus.proto.data.DataCoord/BatchUpdateManifest"
+	DataCoord_CommitBackfillResult_FullMethodName                 = "/milvus.proto.data.DataCoord/CommitBackfillResult"
 	DataCoord_RefreshExternalCollection_FullMethodName            = "/milvus.proto.data.DataCoord/RefreshExternalCollection"
 	DataCoord_GetRefreshExternalCollectionProgress_FullMethodName = "/milvus.proto.data.DataCoord/GetRefreshExternalCollectionProgress"
 	DataCoord_ListRefreshExternalCollectionJobs_FullMethodName    = "/milvus.proto.data.DataCoord/ListRefreshExternalCollectionJobs"
@@ -151,8 +154,13 @@ type DataCoordClient interface {
 	RestoreSnapshot(ctx context.Context, in *RestoreSnapshotRequest, opts ...grpc.CallOption) (*RestoreSnapshotResponse, error)
 	GetRestoreSnapshotState(ctx context.Context, in *GetRestoreSnapshotStateRequest, opts ...grpc.CallOption) (*GetRestoreSnapshotStateResponse, error)
 	ListRestoreSnapshotJobs(ctx context.Context, in *ListRestoreSnapshotJobsRequest, opts ...grpc.CallOption) (*ListRestoreSnapshotJobsResponse, error)
+	PinSnapshotData(ctx context.Context, in *PinSnapshotDataRequest, opts ...grpc.CallOption) (*PinSnapshotDataResponse, error)
+	UnpinSnapshotData(ctx context.Context, in *UnpinSnapshotDataRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
 	// batch update manifest
 	BatchUpdateManifest(ctx context.Context, in *BatchUpdateManifestRequest, opts ...grpc.CallOption) (*commonpb.Status, error)
+	// commit backfill result (reads result JSON from object storage and dispatches
+	// V2/V3 segment updates through the broadcaster)
+	CommitBackfillResult(ctx context.Context, in *CommitBackfillResultRequest, opts ...grpc.CallOption) (*CommitBackfillResultResponse, error)
 	// External Table Refresh APIs
 	RefreshExternalCollection(ctx context.Context, in *RefreshExternalCollectionRequest, opts ...grpc.CallOption) (*RefreshExternalCollectionResponse, error)
 	GetRefreshExternalCollectionProgress(ctx context.Context, in *GetRefreshExternalCollectionProgressRequest, opts ...grpc.CallOption) (*GetRefreshExternalCollectionProgressResponse, error)
@@ -655,9 +663,36 @@ func (c *dataCoordClient) ListRestoreSnapshotJobs(ctx context.Context, in *ListR
 	return out, nil
 }
 
+func (c *dataCoordClient) PinSnapshotData(ctx context.Context, in *PinSnapshotDataRequest, opts ...grpc.CallOption) (*PinSnapshotDataResponse, error) {
+	out := new(PinSnapshotDataResponse)
+	err := c.cc.Invoke(ctx, DataCoord_PinSnapshotData_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataCoordClient) UnpinSnapshotData(ctx context.Context, in *UnpinSnapshotDataRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
+	out := new(commonpb.Status)
+	err := c.cc.Invoke(ctx, DataCoord_UnpinSnapshotData_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *dataCoordClient) BatchUpdateManifest(ctx context.Context, in *BatchUpdateManifestRequest, opts ...grpc.CallOption) (*commonpb.Status, error) {
 	out := new(commonpb.Status)
 	err := c.cc.Invoke(ctx, DataCoord_BatchUpdateManifest_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *dataCoordClient) CommitBackfillResult(ctx context.Context, in *CommitBackfillResultRequest, opts ...grpc.CallOption) (*CommitBackfillResultResponse, error) {
+	out := new(CommitBackfillResultResponse)
+	err := c.cc.Invoke(ctx, DataCoord_CommitBackfillResult_FullMethodName, in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -759,8 +794,13 @@ type DataCoordServer interface {
 	RestoreSnapshot(context.Context, *RestoreSnapshotRequest) (*RestoreSnapshotResponse, error)
 	GetRestoreSnapshotState(context.Context, *GetRestoreSnapshotStateRequest) (*GetRestoreSnapshotStateResponse, error)
 	ListRestoreSnapshotJobs(context.Context, *ListRestoreSnapshotJobsRequest) (*ListRestoreSnapshotJobsResponse, error)
+	PinSnapshotData(context.Context, *PinSnapshotDataRequest) (*PinSnapshotDataResponse, error)
+	UnpinSnapshotData(context.Context, *UnpinSnapshotDataRequest) (*commonpb.Status, error)
 	// batch update manifest
 	BatchUpdateManifest(context.Context, *BatchUpdateManifestRequest) (*commonpb.Status, error)
+	// commit backfill result (reads result JSON from object storage and dispatches
+	// V2/V3 segment updates through the broadcaster)
+	CommitBackfillResult(context.Context, *CommitBackfillResultRequest) (*CommitBackfillResultResponse, error)
 	// External Table Refresh APIs
 	RefreshExternalCollection(context.Context, *RefreshExternalCollectionRequest) (*RefreshExternalCollectionResponse, error)
 	GetRefreshExternalCollectionProgress(context.Context, *GetRefreshExternalCollectionProgressRequest) (*GetRefreshExternalCollectionProgressResponse, error)
@@ -933,8 +973,17 @@ func (UnimplementedDataCoordServer) GetRestoreSnapshotState(context.Context, *Ge
 func (UnimplementedDataCoordServer) ListRestoreSnapshotJobs(context.Context, *ListRestoreSnapshotJobsRequest) (*ListRestoreSnapshotJobsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method ListRestoreSnapshotJobs not implemented")
 }
+func (UnimplementedDataCoordServer) PinSnapshotData(context.Context, *PinSnapshotDataRequest) (*PinSnapshotDataResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PinSnapshotData not implemented")
+}
+func (UnimplementedDataCoordServer) UnpinSnapshotData(context.Context, *UnpinSnapshotDataRequest) (*commonpb.Status, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UnpinSnapshotData not implemented")
+}
 func (UnimplementedDataCoordServer) BatchUpdateManifest(context.Context, *BatchUpdateManifestRequest) (*commonpb.Status, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method BatchUpdateManifest not implemented")
+}
+func (UnimplementedDataCoordServer) CommitBackfillResult(context.Context, *CommitBackfillResultRequest) (*CommitBackfillResultResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CommitBackfillResult not implemented")
 }
 func (UnimplementedDataCoordServer) RefreshExternalCollection(context.Context, *RefreshExternalCollectionRequest) (*RefreshExternalCollectionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RefreshExternalCollection not implemented")
@@ -1929,6 +1978,42 @@ func _DataCoord_ListRestoreSnapshotJobs_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _DataCoord_PinSnapshotData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PinSnapshotDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataCoordServer).PinSnapshotData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataCoord_PinSnapshotData_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataCoordServer).PinSnapshotData(ctx, req.(*PinSnapshotDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataCoord_UnpinSnapshotData_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UnpinSnapshotDataRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataCoordServer).UnpinSnapshotData(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataCoord_UnpinSnapshotData_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataCoordServer).UnpinSnapshotData(ctx, req.(*UnpinSnapshotDataRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _DataCoord_BatchUpdateManifest_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(BatchUpdateManifestRequest)
 	if err := dec(in); err != nil {
@@ -1943,6 +2028,24 @@ func _DataCoord_BatchUpdateManifest_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(DataCoordServer).BatchUpdateManifest(ctx, req.(*BatchUpdateManifestRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _DataCoord_CommitBackfillResult_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CommitBackfillResultRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DataCoordServer).CommitBackfillResult(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: DataCoord_CommitBackfillResult_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DataCoordServer).CommitBackfillResult(ctx, req.(*CommitBackfillResultRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2225,8 +2328,20 @@ var DataCoord_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _DataCoord_ListRestoreSnapshotJobs_Handler,
 		},
 		{
+			MethodName: "PinSnapshotData",
+			Handler:    _DataCoord_PinSnapshotData_Handler,
+		},
+		{
+			MethodName: "UnpinSnapshotData",
+			Handler:    _DataCoord_UnpinSnapshotData_Handler,
+		},
+		{
 			MethodName: "BatchUpdateManifest",
 			Handler:    _DataCoord_BatchUpdateManifest_Handler,
+		},
+		{
+			MethodName: "CommitBackfillResult",
+			Handler:    _DataCoord_CommitBackfillResult_Handler,
 		},
 		{
 			MethodName: "RefreshExternalCollection",

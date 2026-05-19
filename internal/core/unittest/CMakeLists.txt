@@ -16,7 +16,6 @@ include_directories(
     ${KNOWHERE_INCLUDE_DIR}
     ${SIMDJSON_INCLUDE_DIR}
     ${TANTIVY_INCLUDE_DIR}
-    ${CONAN_INCLUDE_DIRS}
     ${MILVUS_COMMON_INCLUDE_DIR}
     ${MILVUS_STORAGE_INCLUDE_DIR}
 )
@@ -61,11 +60,14 @@ set(MILVUS_TEST_FILES
         test_minhash.cpp
         test_async_warmup.cpp
         test_sort_buffer.cpp
+        test_row_container.cpp
         test_query_order_by.cpp
         test_determine_use_index.cpp
         test_virtual_pk.cpp
         test_mvcc_fast_path.cpp
         test_external_take.cpp
+        test_arrow_canonicalize.cpp
+        TextLobSpilloverTest.cpp
         )
 
 if ( NOT (INDEX_ENGINE STREQUAL "cardinal") )
@@ -125,9 +127,10 @@ add_executable(all_tests
         )
 
 target_link_libraries(all_tests
-        gtest
-        gmock
+        GTest::gtest
+        GTest::gmock
         milvus_core
+        milvus_conan_deps
         knowhere
         milvus-storage
         milvus-common
@@ -167,8 +170,7 @@ endif()
 
 target_link_libraries(bitset_test
         milvus_bitset
-        gtest
-        ${CONAN_LIBS}
+        GTest::gtest
 )
 if (LINUX)
     # folly shared library requires libaio; use --no-as-needed to ensure
@@ -179,7 +181,7 @@ endif()
 install(TARGETS bitset_test DESTINATION unittest)
 
 add_executable(test_json_uint64 ${CMAKE_HOME_DIRECTORY}/src/exec/expression/ExprJsonUint64Test.cpp)
-target_link_libraries(test_json_uint64 gtest gtest_main milvus_core knowhere milvus-storage milvus-common ${CONAN_LIBS})
+target_link_libraries(test_json_uint64 GTest::gtest GTest::gtest_main milvus_core milvus_conan_deps knowhere milvus-storage milvus-common)
 target_link_options(test_json_uint64 PRIVATE "-L${PLANPARSER_LIB_DIR}")
 target_link_libraries(test_json_uint64 milvus-planparser-cpp)
 set_target_properties(test_json_uint64 PROPERTIES BUILD_RPATH "${PLANPARSER_LIB_DIR}" INSTALL_RPATH "${PLANPARSER_LIB_DIR}")

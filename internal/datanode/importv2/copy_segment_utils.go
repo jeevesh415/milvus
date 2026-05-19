@@ -19,19 +19,22 @@ package importv2
 import (
 	"context"
 	"fmt"
+	"path"
 	"strconv"
 	"strings"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/milvus-io/milvus/internal/compaction"
 	"github.com/milvus-io/milvus/internal/metastore/kv/binlog"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/storagev2/packed"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/metautil"
 )
 
 // SegmentFiles organizes source files by type for copy operations.
@@ -41,14 +44,17 @@ type SegmentFiles struct {
 	// From manifest (when storage_version >= StorageV3) or pb (when < StorageV3)
 	InsertBinlogs []string
 
+	// LOB files at partition level (only for StorageV3+ with TEXT fields)
+	LobFiles []string
+
 	// Always from pb
 	DeltaBinlogs      []string
 	StatsBinlogs      []string
 	Bm25Binlogs       []string
 	VectorScalarIndex []string
 	TextIndex         []string
-	JsonKeyIndex      []string
-	JsonStats         []string
+	JSONKeyIndex      []string
+	JSONStats         []string
 }
 
 // Copy Mode Implementation for Snapshot/Backup Import
@@ -99,7 +105,7 @@ type SegmentFiles struct {
 //
 // Process:
 // 1. Unmarshal JSON to get base_path and version
-// 2. Replace collection/partition/segment IDs in base_path using generateTargetPath
+// 2. Replace collection/partition/segment IDs in base_path
 // 3. Marshal back to JSON
 func transformManifestPath(
 	manifestPath string,
@@ -161,6 +167,16 @@ func extractIndexFiles(indexInfos []*indexpb.IndexFilePathInfo) []string {
 	return paths
 }
 
+func buildIndexPathVersionByFile(source *datapb.CopySegmentSource) map[string]indexpb.IndexStorePathVersion {
+	versions := make(map[string]indexpb.IndexStorePathVersion)
+	for _, indexInfo := range source.GetIndexFiles() {
+		for _, filePath := range indexInfo.GetIndexFilePaths() {
+			versions[filePath] = indexInfo.GetIndexStorePathVersion()
+		}
+	}
+	return versions
+}
+
 // extractTextIndexFiles extracts text index file paths.
 func extractTextIndexFiles(textIndexInfos map[int64]*datapb.TextIndexStats) []string {
 	var paths []string
@@ -170,9 +186,9 @@ func extractTextIndexFiles(textIndexInfos map[int64]*datapb.TextIndexStats) []st
 	return paths
 }
 
-// extractJsonFiles extracts JSON index files, separated by data format version.
+// extractJSONFiles extracts JSON index files, separated by data format version.
 // Returns (jsonKeyFiles, jsonStatsFiles).
-func extractJsonFiles(jsonIndexInfos map[int64]*datapb.JsonKeyStats) ([]string, []string) {
+func extractJSONFiles(jsonIndexInfos map[int64]*datapb.JsonKeyStats) ([]string, []string) {
 	var jsonKeyFiles []string
 	var jsonStatsFiles []string
 
@@ -231,6 +247,26 @@ func collectSegmentFiles(
 			zap.String("basePath", basePath),
 			zap.Int("fileCount", len(allFiles)),
 			zap.Int64("storageVersion", source.GetStorageVersion()))
+
+		// Collect LOB files owned by THIS segment from the manifest.
+		// LOB files live at partition level ({root}/insert_log/{coll}/{part}/lobs/),
+		// but multiple segments share that directory. We must only copy the files
+		// referenced by this segment's manifest to preserve the invariant that
+		// each LOB file belongs to exactly one segment.
+		storageConfig := compaction.CreateStorageConfig()
+		lobFileInfos, lobErr := packed.GetManifestLobFiles(manifestPath, storageConfig)
+		if lobErr != nil {
+			log.Debug("no LOB files found in manifest (may not have TEXT fields)",
+				zap.String("manifestPath", manifestPath),
+				zap.Error(lobErr))
+		} else if len(lobFileInfos) > 0 {
+			// GetManifestLobFiles returns absolute paths (the manifest
+			// deserializer calls ToAbsolute internally), so use them directly.
+			files.LobFiles = lobFileInfosToPaths(lobFileInfos)
+			log.Info("collected LOB files from segment manifest",
+				zap.String("manifestPath", manifestPath),
+				zap.Int("lobFileCount", len(files.LobFiles)))
+		}
 	} else {
 		// StorageV1/V2: use pb paths (traditional non-packed format)
 		files.InsertBinlogs = extractFromPb(source.GetInsertBinlogs())
@@ -250,7 +286,7 @@ func collectSegmentFiles(
 	// using potentially stale or wrong-format paths from etcd metadata.
 	if source.GetStorageVersion() < storage.StorageV3 {
 		files.TextIndex = extractTextIndexFiles(source.GetTextIndexFiles())
-		files.JsonKeyIndex, files.JsonStats = extractJsonFiles(source.GetJsonKeyIndexFiles())
+		files.JSONKeyIndex, files.JSONStats = extractJSONFiles(source.GetJsonKeyIndexFiles())
 	}
 
 	return files, nil
@@ -264,6 +300,7 @@ func generateMappingsFromFiles(
 	target *datapb.CopySegmentTarget,
 ) (map[string]string, error) {
 	mappings := make(map[string]string)
+	indexPathVersions := buildIndexPathVersionByFile(source)
 
 	// Helper to add mappings with error handling
 	addMappings := func(srcPaths []string, fileType string) error {
@@ -273,8 +310,10 @@ func generateMappingsFromFiles(
 
 			// Determine path generation logic based on file type
 			switch fileType {
-			case IndexTypeVectorScalar, IndexTypeText, IndexTypeJSONKey, IndexTypeJSONStats:
-				dstPath, err = generateTargetIndexPath(srcPath, source, target, fileType)
+			case IndexTypeVectorScalarV0, IndexTypeText, IndexTypeJSONKey, IndexTypeJSONStats:
+				dstPath, err = generateTargetIndexPath(srcPath, source, target, fileType, indexPathVersions[srcPath])
+			case FileTypeLOB:
+				dstPath, err = generateTargetLOBPath(srcPath, source, target)
 			default:
 				dstPath, err = generateTargetPath(srcPath, source, target)
 			}
@@ -300,16 +339,21 @@ func generateMappingsFromFiles(
 	if err := addMappings(files.Bm25Binlogs, BinlogTypeBM25); err != nil {
 		return nil, err
 	}
-	if err := addMappings(files.VectorScalarIndex, IndexTypeVectorScalar); err != nil {
+	// Vector/scalar index copy uses the v0 type as the logical input; the
+	// per-file IndexStorePathVersion switches storage matching to index_v1 when needed.
+	if err := addMappings(files.VectorScalarIndex, IndexTypeVectorScalarV0); err != nil {
 		return nil, err
 	}
 	if err := addMappings(files.TextIndex, IndexTypeText); err != nil {
 		return nil, err
 	}
-	if err := addMappings(files.JsonKeyIndex, IndexTypeJSONKey); err != nil {
+	if err := addMappings(files.JSONKeyIndex, IndexTypeJSONKey); err != nil {
 		return nil, err
 	}
-	if err := addMappings(files.JsonStats, IndexTypeJSONStats); err != nil {
+	if err := addMappings(files.JSONStats, IndexTypeJSONStats); err != nil {
+		return nil, err
+	}
+	if err := addMappings(files.LobFiles, FileTypeLOB); err != nil {
 		return nil, err
 	}
 
@@ -329,7 +373,8 @@ func CopySegmentAndIndexFiles(
 	log.Info("start copying segment and index files",
 		zap.Int64("sourceSegmentID", segmentID),
 		zap.Int64("storageVersion", source.GetStorageVersion()),
-		zap.Bool("useManifest", useManifest))
+		zap.Bool("useManifest", useManifest),
+		zap.Bool("isExternalCollection", source.GetIsExternalCollection()))
 
 	// Step 1: Collect all files to copy
 	files, err := collectSegmentFiles(ctx, cm, source)
@@ -405,7 +450,7 @@ func CopySegmentAndIndexFiles(
 		indexInfo.IndexFilePaths = shortenIndexFilePaths(indexInfo.IndexFilePaths)
 	}
 
-	jsonKeyIndexInfos = shortenJsonStatsPath(jsonKeyIndexInfos)
+	jsonKeyIndexInfos = shortenJSONStatsPath(jsonKeyIndexInfos)
 
 	log.Info("path compression completed",
 		zap.Int("binlogFields", len(segmentInfo.GetBinlogs())),
@@ -451,6 +496,8 @@ func CopySegmentAndIndexFiles(
 //   - srcFieldBinlogs: Source field binlogs with original paths
 //   - mappings: Pre-calculated map of source path -> target path
 //   - countRows: If true, accumulate total row count from EntriesNum (for insert logs only)
+//   - isExternalTable: If true, skip path mapping because external table insert
+//     binlogs carry row metadata without physical log paths
 //
 // Returns:
 //   - []*datapb.FieldBinlog: Transformed binlog list with target paths
@@ -459,7 +506,8 @@ func CopySegmentAndIndexFiles(
 func transformFieldBinlogs(
 	srcFieldBinlogs []*datapb.FieldBinlog,
 	mappings map[string]string,
-	countRows bool, // true for insert logs to count total rows
+	countRows bool,
+	isExternalTable bool,
 ) ([]*datapb.FieldBinlog, int64, error) {
 	result := make([]*datapb.FieldBinlog, 0, len(srcFieldBinlogs))
 	var totalRows int64
@@ -469,18 +517,23 @@ func transformFieldBinlogs(
 		dstFieldBinlog.Binlogs = make([]*datapb.Binlog, 0, len(srcFieldBinlog.GetBinlogs()))
 
 		for _, srcBinlog := range srcFieldBinlog.GetBinlogs() {
-			if srcPath := srcBinlog.GetLogPath(); srcPath != "" {
+			dstBinlog := proto.Clone(srcBinlog).(*datapb.Binlog)
+
+			if !isExternalTable {
+				srcPath := srcBinlog.GetLogPath()
+				if srcPath == "" {
+					continue
+				}
 				dstPath, ok := mappings[srcPath]
 				if !ok {
 					return nil, 0, fmt.Errorf("no mapping found for source path: %s", srcPath)
 				}
-				dstBinlog := proto.Clone(srcBinlog).(*datapb.Binlog)
 				dstBinlog.LogPath = dstPath
-				dstFieldBinlog.Binlogs = append(dstFieldBinlog.Binlogs, dstBinlog)
+			}
 
-				if countRows {
-					totalRows += srcBinlog.GetEntriesNum()
-				}
+			dstFieldBinlog.Binlogs = append(dstFieldBinlog.Binlogs, dstBinlog)
+			if countRows {
+				totalRows += srcBinlog.GetEntriesNum()
 			}
 		}
 
@@ -528,7 +581,7 @@ func generateSegmentInfoFromSource(
 	}
 
 	// Process insert binlogs (count rows)
-	binlogs, totalRows, err := transformFieldBinlogs(source.GetInsertBinlogs(), mappings, true)
+	binlogs, totalRows, err := transformFieldBinlogs(source.GetInsertBinlogs(), mappings, true, source.GetIsExternalCollection())
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform insert binlogs: %w", err)
 	}
@@ -536,21 +589,21 @@ func generateSegmentInfoFromSource(
 	segmentInfo.ImportedRows = totalRows
 
 	// Process stats binlogs (no row counting)
-	statslogs, _, err := transformFieldBinlogs(source.GetStatsBinlogs(), mappings, false)
+	statslogs, _, err := transformFieldBinlogs(source.GetStatsBinlogs(), mappings, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform stats binlogs: %w", err)
 	}
 	segmentInfo.Statslogs = statslogs
 
 	// Process delta binlogs (no row counting)
-	deltalogs, _, err := transformFieldBinlogs(source.GetDeltaBinlogs(), mappings, false)
+	deltalogs, _, err := transformFieldBinlogs(source.GetDeltaBinlogs(), mappings, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform delta binlogs: %w", err)
 	}
 	segmentInfo.Deltalogs = deltalogs
 
 	// Process BM25 binlogs (no row counting)
-	bm25logs, _, err := transformFieldBinlogs(source.GetBm25Binlogs(), mappings, false)
+	bm25logs, _, err := transformFieldBinlogs(source.GetBm25Binlogs(), mappings, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform BM25 binlogs: %w", err)
 	}
@@ -594,7 +647,33 @@ func generateTargetPath(sourcePath string, source *datapb.CopySegmentSource, tar
 	parts[logTypeIndex+2] = targetPartitionIDStr
 	parts[logTypeIndex+3] = targetSegmentIDStr
 
-	return strings.Join(parts, "/"), nil
+	return path.Join(parts...), nil
+}
+
+// generateTargetLOBPath replaces collection and partition IDs in a LOB file path.
+// LOB path structure: {root}/insert_log/{coll}/{part}/lobs/{field}/_data/{file}.vx
+// Unlike segment paths, LOB paths have no segment ID component.
+func generateTargetLOBPath(sourcePath string, source *datapb.CopySegmentSource, target *datapb.CopySegmentTarget) (string, error) {
+	parts := strings.Split(sourcePath, "/")
+
+	logTypeIndex := -1
+	for i, part := range parts {
+		if part == BinlogTypeInsert {
+			logTypeIndex = i
+			break
+		}
+	}
+
+	// Path: .../{insert_log}/{coll}/{part}/lobs/...
+	// Need at least logTypeIndex + 2 (coll and part) after insert_log
+	if logTypeIndex == -1 || logTypeIndex+2 >= len(parts) {
+		return "", fmt.Errorf("invalid LOB path structure: %s", sourcePath)
+	}
+
+	parts[logTypeIndex+1] = strconv.FormatInt(target.GetCollectionId(), 10)
+	parts[logTypeIndex+2] = strconv.FormatInt(target.GetPartitionId(), 10)
+
+	return path.Join(parts...), nil
 }
 
 // buildIndexInfoFromSource builds complete index metadata from source information.
@@ -651,6 +730,7 @@ func buildIndexInfoFromSource(
 			CurrentIndexVersion:       srcIndex.GetCurrentIndexVersion(),
 			CurrentScalarIndexVersion: srcIndex.GetCurrentScalarIndexVersion(),
 			IndexName:                 srcIndex.GetIndexName(),
+			IndexStorePathVersion:     srcIndex.GetIndexStorePathVersion(),
 		}
 	}
 
@@ -692,17 +772,17 @@ func buildIndexInfoFromSource(
 	// pass metadata as placeholders. For V2, transform file paths using mappings.
 	jsonKeyIndexInfos := make(map[int64]*datapb.JsonKeyStats)
 	if source.GetStorageVersion() >= storage.StorageV3 {
-		for fieldID, srcJson := range source.GetJsonKeyIndexFiles() {
-			dstJson := proto.Clone(srcJson).(*datapb.JsonKeyStats)
-			if newID, ok := target.GetNewBuildIds()[dstJson.GetBuildID()]; ok {
-				dstJson.BuildID = newID
+		for fieldID, srcJSON := range source.GetJsonKeyIndexFiles() {
+			dstJSON := proto.Clone(srcJSON).(*datapb.JsonKeyStats)
+			if newID, ok := target.GetNewBuildIds()[dstJSON.GetBuildID()]; ok {
+				dstJSON.BuildID = newID
 			}
-			jsonKeyIndexInfos[fieldID] = dstJson
+			jsonKeyIndexInfos[fieldID] = dstJSON
 		}
 	} else {
-		for fieldID, srcJson := range source.GetJsonKeyIndexFiles() {
-			targetFiles := make([]string, 0, len(srcJson.GetFiles()))
-			for _, srcFile := range srcJson.GetFiles() {
+		for fieldID, srcJSON := range source.GetJsonKeyIndexFiles() {
+			targetFiles := make([]string, 0, len(srcJSON.GetFiles()))
+			for _, srcFile := range srcJSON.GetFiles() {
 				targetFile, ok := mappings[srcFile]
 				if !ok {
 					return nil, nil, nil, fmt.Errorf("no mapping found for JSON index file: %s", srcFile)
@@ -710,12 +790,12 @@ func buildIndexInfoFromSource(
 				targetFiles = append(targetFiles, targetFile)
 			}
 
-			dstJson := proto.Clone(srcJson).(*datapb.JsonKeyStats)
-			dstJson.Files = targetFiles
-			if newID, ok := target.GetNewBuildIds()[dstJson.GetBuildID()]; ok {
-				dstJson.BuildID = newID
+			dstJSON := proto.Clone(srcJSON).(*datapb.JsonKeyStats)
+			dstJSON.Files = targetFiles
+			if newID, ok := target.GetNewBuildIds()[dstJSON.GetBuildID()]; ok {
+				dstJSON.BuildID = newID
 			}
-			jsonKeyIndexInfos[fieldID] = dstJson
+			jsonKeyIndexInfos[fieldID] = dstJSON
 		}
 	}
 
@@ -726,26 +806,42 @@ func buildIndexInfoFromSource(
 // File Type Constants
 // ============================================================================
 
+// lobFileInfosToPaths extracts absolute file paths from LobFileInfo structs.
+// GetManifestLobFiles returns paths that have already been resolved to absolute
+// form by the C++ manifest deserializer (Manifest::ToAbsolutePaths), so we use
+// them directly without any path concatenation.
+func lobFileInfosToPaths(infos []packed.LobFileInfo) []string {
+	paths := make([]string, 0, len(infos))
+	for _, info := range infos {
+		paths = append(paths, info.Path)
+	}
+	return paths
+}
+
 // File type constants used for path identification and generation.
 // These constants match the directory names in Milvus storage paths.
 const (
-	BinlogTypeInsert      = "insert_log"
-	BinlogTypeStats       = "stats_log"
-	BinlogTypeDelta       = "delta_log"
-	BinlogTypeBM25        = "bm25_stats"
-	IndexTypeVectorScalar = "index_files"
-	IndexTypeText         = "text_log"
-	IndexTypeJSONKey      = "json_key_index_log" // Legacy: JSON Key Inverted Index
-	IndexTypeJSONStats    = "json_stats"         // New: JSON Stats with Shredding Design
+	BinlogTypeInsert        = "insert_log"
+	BinlogTypeStats         = "stats_log"
+	BinlogTypeDelta         = "delta_log"
+	BinlogTypeBM25          = "bm25_stats"
+	IndexTypeVectorScalarV0 = "index_files"
+	IndexTypeVectorScalarV1 = "index_v1"
+	IndexTypeText           = "text_log"
+	IndexTypeJSONKey        = "json_key_index_log" // Legacy: JSON Key Inverted Index
+	IndexTypeJSONStats      = "json_stats"         // New: JSON Stats with Shredding Design
+	FileTypeLOB             = "lob"                // LOB files at partition level for TEXT fields
 )
 
 // generateTargetIndexPath is the unified function for generating target paths for all index types
 // The indexType parameter specifies which type of index path to generate
 //
 // Supported index types (use constants):
-//   - IndexTypeVectorScalar: Vector/Scalar Index path format (from BuildSegmentIndexFilePaths)
+//   - IndexTypeVectorScalarV0: Vector/Scalar v0 path format (legacy index_files prefix)
 //     {rootPath}/index_files/{build_id}/{index_version}/{partition_id}/{segment_id}/file
 //     Note: collectionID is NOT in the path, only partitionID and segmentID are replaced
+//   - IndexTypeVectorScalarV1: Vector/Scalar v1 path format (index_v1 prefix)
+//     {rootPath}/index_v1/{collection_id}/{partition_id}/{segment_id}/{build_id}/{index_version}/file
 //   - IndexTypeText: Text Index path format
 //     {rootPath}/text_log/{build_id}/{version}/{collection_id}/{partition_id}/{segment_id}/{field_id}/file
 //   - IndexTypeJSONKey: JSON Key Index path format (legacy)
@@ -754,7 +850,7 @@ const (
 //     {rootPath}/json_stats/{data_format_version}/{build_id}/{version}/{collection_id}/{partition_id}/{segment_id}/{field_id}/(shared_key_index|shredding_data)/...
 //
 // Examples:
-// generateTargetIndexPath(..., IndexTypeVectorScalar):
+// generateTargetIndexPath(..., IndexTypeVectorScalarV0):
 //
 //	files/index_files/1001/1/222/333/scalar_index -> files/index_files/1001/1/bbb/ccc/scalar_index
 //
@@ -774,6 +870,7 @@ func generateTargetIndexPath(
 	source *datapb.CopySegmentSource,
 	target *datapb.CopySegmentTarget,
 	indexType string,
+	pathVersion indexpb.IndexStorePathVersion,
 ) (string, error) {
 	// Split path into parts
 	parts := strings.Split(sourcePath, "/")
@@ -782,41 +879,57 @@ func generateTargetIndexPath(
 	var keywordIdx int
 	var collectionOffset, partitionOffset, segmentOffset int
 
+	keyword := indexType
+	if indexType == IndexTypeVectorScalarV0 && metautil.IsCollectionRooted(pathVersion) {
+		// The caller still passes the vector/scalar logical type, but v1 files
+		// live under a different object-storage prefix.
+		keyword = IndexTypeVectorScalarV1
+	}
+
 	// Find the keyword position in the path
 	keywordIdx = -1
 	for i, part := range parts {
-		if part == indexType {
+		if part == keyword {
 			keywordIdx = i
 			break
 		}
 	}
 
 	if keywordIdx == -1 {
-		return "", fmt.Errorf("keyword '%s' not found in path: %s", indexType, sourcePath)
+		return "", fmt.Errorf("keyword '%s' not found in path: %s", keyword, sourcePath)
 	}
 
 	// Set offsets based on index type
 	// collectionOffset = -1 means collectionID is not present in the path
+	var buildIDOffset int
 	switch indexType {
-	case IndexTypeVectorScalar:
-		// Vector/Scalar index: index_files/{buildID}/{indexVersion}/{partID}/{segID}/{fileKey}
-		// Path generated by BuildSegmentIndexFilePaths - no collectionID in path
-		collectionOffset = -1
-		partitionOffset = 3
-		segmentOffset = 4
+	case IndexTypeVectorScalarV0:
+		if metautil.IsCollectionRooted(pathVersion) {
+			collectionOffset = 1
+			partitionOffset = 2
+			segmentOffset = 3
+			buildIDOffset = 4
+		} else {
+			collectionOffset = -1
+			partitionOffset = 3
+			segmentOffset = 4
+			buildIDOffset = 1
+		}
 	case IndexTypeText, IndexTypeJSONKey:
 		// Text/JSON index: text_log|json_key_index_log/build/ver/coll/part/seg/field
 		collectionOffset = 3
 		partitionOffset = 4
 		segmentOffset = 5
+		buildIDOffset = 1
 	case IndexTypeJSONStats:
 		// JSON Stats: json_stats/data_format_ver/build/ver/coll/part/seg/field/(shared_key_index|shredding_data)/...
 		collectionOffset = 4 // One more level than legacy (data_format_version)
 		partitionOffset = 5
 		segmentOffset = 6
+		buildIDOffset = 2
 	default:
 		return "", fmt.Errorf("unsupported index type: %s (expected '%s', '%s', '%s', or '%s')",
-			indexType, IndexTypeVectorScalar, IndexTypeText, IndexTypeJSONKey, IndexTypeJSONStats)
+			indexType, IndexTypeVectorScalarV0, IndexTypeText, IndexTypeJSONKey, IndexTypeJSONStats)
 	}
 
 	// Validate path structure has enough components
@@ -826,11 +939,6 @@ func generateTargetIndexPath(
 	}
 
 	// Replace buildID if a mapping exists in target.NewBuildIds
-	// All index types have buildID at offset 1, except JSONStats which has it at offset 2
-	buildIDOffset := 1
-	if indexType == IndexTypeJSONStats {
-		buildIDOffset = 2
-	}
 	if keywordIdx+buildIDOffset < len(parts) {
 		oldBuildIDStr := parts[keywordIdx+buildIDOffset]
 		oldBuildID, parseErr := strconv.ParseInt(oldBuildIDStr, 10, 64)
@@ -849,7 +957,7 @@ func generateTargetIndexPath(
 	parts[keywordIdx+partitionOffset] = strconv.FormatInt(target.GetPartitionId(), 10)
 	parts[keywordIdx+segmentOffset] = strconv.FormatInt(target.GetSegmentId(), 10)
 
-	return strings.Join(parts, "/"), nil
+	return path.Join(parts...), nil
 }
 
 // ============================================================================
@@ -897,7 +1005,7 @@ func shortenIndexFilePaths(fullPaths []string) []string {
 	return result
 }
 
-// shortenJsonStatsPath shortens JSON stats file paths to only keep the last 2+ segments.
+// shortenJSONStatsPath shortens JSON stats file paths to only keep the last 2+ segments.
 //
 // In normal import flow, the C++ core returns already-shortened paths (e.g., "shared_key_index/file").
 // In copy segment flow, DataNode returns full paths after file copying.
@@ -912,12 +1020,12 @@ func shortenIndexFilePaths(fullPaths []string) []string {
 //
 // Returns:
 //   - Map of field ID to JsonKeyStats with shortened paths
-func shortenJsonStatsPath(jsonStats map[int64]*datapb.JsonKeyStats) map[int64]*datapb.JsonKeyStats {
+func shortenJSONStatsPath(jsonStats map[int64]*datapb.JsonKeyStats) map[int64]*datapb.JsonKeyStats {
 	result := make(map[int64]*datapb.JsonKeyStats)
 	for fieldID, stats := range jsonStats {
 		shortenedFiles := make([]string, 0, len(stats.GetFiles()))
 		for _, file := range stats.GetFiles() {
-			shortenedFiles = append(shortenedFiles, shortenSingleJsonStatsPath(file))
+			shortenedFiles = append(shortenedFiles, shortenSingleJSONStatsPath(file))
 		}
 
 		result[fieldID] = &datapb.JsonKeyStats{
@@ -933,7 +1041,7 @@ func shortenJsonStatsPath(jsonStats map[int64]*datapb.JsonKeyStats) map[int64]*d
 	return result
 }
 
-// shortenSingleJsonStatsPath shortens a single JSON stats file path.
+// shortenSingleJSONStatsPath shortens a single JSON stats file path.
 //
 // This function extracts the relative path from a full JSON stats file path by:
 //  1. Finding "shared_key_index" or "shredding_data" keywords and extracting from that position
@@ -959,7 +1067,7 @@ func shortenJsonStatsPath(jsonStats map[int64]*datapb.JsonKeyStats) map[int64]*d
 //
 // Returns:
 //   - Shortened path relative to fieldID directory
-func shortenSingleJsonStatsPath(fullPath string) string {
+func shortenSingleJSONStatsPath(fullPath string) string {
 	// Find "shared_key_index" in path
 	if idx := strings.Index(fullPath, jsonStatsSharedIndexPath); idx != -1 {
 		return fullPath[idx:]
@@ -975,7 +1083,7 @@ func shortenSingleJsonStatsPath(fullPath string) string {
 	parts := strings.Split(fullPath, "/")
 	for i, part := range parts {
 		if part == common.JSONStatsPath && i+8 < len(parts) {
-			return strings.Join(parts[i+8:], "/")
+			return path.Join(parts[i+8:]...)
 		}
 	}
 

@@ -56,6 +56,8 @@ const (
 	RouteGcPause  = "/management/datacoord/garbage_collection/pause"
 	RouteGcResume = "/management/datacoord/garbage_collection/resume"
 
+	RouteCommitBackfill = "/management/datacoord/backfill/commit"
+
 	RouteSuspendQueryCoordBalance = "/management/querycoord/balance/suspend"
 	RouteResumeQueryCoordBalance  = "/management/querycoord/balance/resume"
 	RouteQueryCoordBalanceStatus  = "/management/querycoord/balance/status"
@@ -85,8 +87,11 @@ const (
 	WALAlterPath = "/management/wal/alter"
 
 	ConfigAlterPath = "/management/config/alter"
+	ConfigGetPath   = "/management/config/get"
 
 	DataGCPath = "/management/data_gc"
+
+	ReplicaLoadConfigCompliancePath = "/management/replica/loadconfig/compliance"
 )
 
 // for WebUI restful api root path

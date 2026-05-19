@@ -39,12 +39,12 @@ import (
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/storage"
 	kvfactory "github.com/milvus-io/milvus/internal/util/dependency/kv"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/retry"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/retry"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 const (
@@ -143,6 +143,14 @@ func (s *SessionRaw) GetServerID() int64 {
 
 func (s *SessionRaw) GetServerLabel() map[string]string {
 	return s.ServerLabels
+}
+
+// GetResourceGroupName returns the resource group name of the session.
+func (s *SessionRaw) GetResourceGroupName() string {
+	if s.ServerLabels == nil {
+		return ""
+	}
+	return s.ServerLabels[LabelResourceGroup]
 }
 
 // Session is a struct to store service's session, including ServerID, ServerName,

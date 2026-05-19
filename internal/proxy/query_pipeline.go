@@ -23,18 +23,18 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/agg"
 	"github.com/milvus-io/milvus/internal/util/queryutil"
 	"github.com/milvus-io/milvus/internal/util/reduce"
 	"github.com/milvus-io/milvus/internal/util/reduce/orderby"
 	typeutil2 "github.com/milvus-io/milvus/internal/util/typeutil"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 // Channel names for query pipeline data flow
@@ -119,7 +119,7 @@ func buildPlainQueryPipeline(
 	reduceType reduce.IReduceType,
 ) *queryutil.Pipeline {
 	b := queryutil.NewPipelineBuilder("proxy-query-plain")
-	b.Add(queryutil.OpReduceByPK, in(), ch(chanReduced), queryutil.NewSortAndCheckPKOperator(reduceType))
+	b.Add(queryutil.OpReduceByPK, in(), ch(chanReduced), queryutil.NewSortAndCheckPKOperator(reduceType, schema))
 	b.Add(queryutil.OpSlice, ch(chanReduced), ch(chanSliced), queryutil.NewSliceOperator(limit, offset))
 	b.Add("complement_fields", ch(chanSliced), out(), newComplementFieldOperator(schema))
 	return b.Build()
@@ -133,7 +133,7 @@ func buildOrderByPipeline(
 	outputFieldIDs []int64,
 ) *queryutil.Pipeline {
 	b := queryutil.NewPipelineBuilder("proxy-query-orderby")
-	b.Add(queryutil.OpConcatAndCheckPK, in(), ch(chanReduced), queryutil.NewConcatAndCheckPKOperator())
+	b.Add(queryutil.OpConcatAndCheckPK, in(), ch(chanReduced), queryutil.NewConcatAndCheckPKOperator(schema))
 	b.Add(queryutil.OpOrderByLimit, ch(chanReduced), ch(chanSorted), queryutil.NewOrderByLimitOperator(orderByFields, offset+limit))
 	b.Add(queryutil.OpSlice, ch(chanSorted), ch(chanSliced), queryutil.NewSliceOperator(limit, offset))
 

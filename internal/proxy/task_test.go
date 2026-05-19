@@ -34,30 +34,31 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/allocator"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/mocks"
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/metric"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/testutils"
-	"github.com/milvus-io/milvus/pkg/v2/util/timerecord"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/uniquegenerator"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/rootcoordpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metric"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/testutils"
+	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/uniquegenerator"
 )
 
 // TODO(dragondriver): add more test cases
@@ -1256,6 +1257,142 @@ func TestAddFieldTask(t *testing.T) {
 	})
 }
 
+func TestAddCollectionStructFieldTaskPreExecute(t *testing.T) {
+	ctx := context.Background()
+	oldSchema := &schemapb.CollectionSchema{
+		Name: "test_collection",
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      100,
+				Name:         "pk",
+				DataType:     schemapb.DataType_Int64,
+				IsPrimaryKey: true,
+			},
+		},
+	}
+	structField := newAddStructFieldSchema("profile")
+
+	task := &addCollectionStructFieldTask{
+		Condition: NewTaskCondition(ctx),
+		AddCollectionStructFieldRequest: &milvuspb.AddCollectionStructFieldRequest{
+			DbName:                 "",
+			CollectionName:         oldSchema.GetName(),
+			StructArrayFieldSchema: structField,
+		},
+		ctx:       ctx,
+		mixCoord:  NewMixCoordMock(),
+		oldSchema: oldSchema,
+	}
+
+	require.NoError(t, task.OnEnqueue())
+	assert.Equal(t, commonpb.MsgType_AddCollectionField, task.Type())
+
+	require.NoError(t, task.PreExecute(ctx))
+
+	got := task.GetStructArrayFieldSchema()
+	require.NotSame(t, structField, got)
+	require.Len(t, got.GetFields(), 2)
+	assert.Equal(t, "profile[ints]", got.GetFields()[0].GetName())
+	assert.Equal(t, "profile[vectors]", got.GetFields()[1].GetName())
+	assert.True(t, got.GetFields()[0].GetNullable())
+	assert.True(t, got.GetFields()[1].GetNullable())
+
+	// PreExecute works on a cloned schema, so callers do not observe partial mutation on failure.
+	assert.Equal(t, "ints", structField.GetFields()[0].GetName())
+	assert.Equal(t, "vectors", structField.GetFields()[1].GetName())
+}
+
+func TestValidateAddStructFieldRequest(t *testing.T) {
+	baseSchema := &schemapb.CollectionSchema{
+		Name: "test_collection",
+		Fields: []*schemapb.FieldSchema{
+			{
+				Name:     "pk",
+				DataType: schemapb.DataType_Int64,
+			},
+		},
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		err := validateAddStructFieldRequest(proto.Clone(baseSchema).(*schemapb.CollectionSchema), newAddStructFieldSchema("profile"))
+		require.NoError(t, err)
+	})
+
+	t.Run("struct must be nullable", func(t *testing.T) {
+		structField := newAddStructFieldSchema("profile")
+		structField.Nullable = false
+
+		err := validateAddStructFieldRequest(proto.Clone(baseSchema).(*schemapb.CollectionSchema), structField)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.Contains(t, err.Error(), "added struct field must be nullable")
+	})
+
+	t.Run("duplicate parent name", func(t *testing.T) {
+		err := validateAddStructFieldRequest(proto.Clone(baseSchema).(*schemapb.CollectionSchema), newAddStructFieldSchema("pk"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.Contains(t, err.Error(), "duplicated field name pk")
+	})
+
+	t.Run("duplicate transformed sub field name", func(t *testing.T) {
+		schema := proto.Clone(baseSchema).(*schemapb.CollectionSchema)
+		schema.Fields = append(schema.Fields, &schemapb.FieldSchema{
+			Name:     "profile[ints]",
+			DataType: schemapb.DataType_Int64,
+		})
+
+		err := validateAddStructFieldRequest(schema, newAddStructFieldSchema("profile"))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.Contains(t, err.Error(), "duplicated field name profile[ints]")
+	})
+
+	t.Run("max field count includes struct parent", func(t *testing.T) {
+		Params.Save(Params.ProxyCfg.MaxFieldNum.Key, "3")
+		defer Params.Reset(Params.ProxyCfg.MaxFieldNum.Key)
+
+		err := validateAddStructFieldRequest(proto.Clone(baseSchema).(*schemapb.CollectionSchema), newAddStructFieldSchema("profile"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "maximum field's number should be limited to 3")
+	})
+
+	t.Run("vector count includes array of vector sub field", func(t *testing.T) {
+		Params.Save(Params.ProxyCfg.MaxVectorFieldNum.Key, "0")
+		defer Params.Reset(Params.ProxyCfg.MaxVectorFieldNum.Key)
+
+		err := validateAddStructFieldRequest(proto.Clone(baseSchema).(*schemapb.CollectionSchema), newAddStructFieldSchema("profile"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "maximum vector field's number should be limited to 0")
+	})
+}
+
+func newAddStructFieldSchema(name string) *schemapb.StructArrayFieldSchema {
+	return &schemapb.StructArrayFieldSchema{
+		Name:     name,
+		Nullable: true,
+		Fields: []*schemapb.FieldSchema{
+			{
+				Name:        "ints",
+				DataType:    schemapb.DataType_Array,
+				ElementType: schemapb.DataType_Int64,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.MaxCapacityKey, Value: "16"},
+				},
+			},
+			{
+				Name:        "vectors",
+				DataType:    schemapb.DataType_ArrayOfVector,
+				ElementType: schemapb.DataType_FloatVector,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.DimKey, Value: "8"},
+					{Key: common.MaxCapacityKey, Value: "16"},
+				},
+			},
+		},
+	}
+}
+
 func TestCreateCollectionTask(t *testing.T) {
 	mix := NewMixCoordMock()
 	ctx := context.Background()
@@ -1371,7 +1508,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		marshaledSchemaWithTooManyFields, err := proto.Marshal(schemaWithTooManyFields)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = marshaledSchemaWithTooManyFields
+		task.Schema = marshaledSchemaWithTooManyFields
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1397,7 +1534,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		tooManyVectorFieldsSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = tooManyVectorFieldsSchema
+		task.Schema = tooManyVectorFieldsSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1416,7 +1553,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		noVectorSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = noVectorSchema
+		task.Schema = noVectorSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1427,7 +1564,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		schema.Name = " " // empty
 		emptyNameSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = emptyNameSchema
+		task.Schema = emptyNameSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1437,14 +1574,14 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		tooLongNameSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = tooLongNameSchema
+		task.Schema = tooLongNameSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
 		schema.Name = "$" // invalid first char
 		invalidFirstCharSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = invalidFirstCharSchema
+		task.Schema = invalidFirstCharSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1453,7 +1590,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		schema.Fields = append(schema.Fields, schema.Fields[0])
 		duplicatedFieldsSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = duplicatedFieldsSchema
+		task.Schema = duplicatedFieldsSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1464,7 +1601,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		noPrimaryFieldsSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = noPrimaryFieldsSchema
+		task.Schema = noPrimaryFieldsSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1475,7 +1612,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		invalidFieldNameSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = invalidFieldNameSchema
+		task.Schema = invalidFieldNameSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1488,7 +1625,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		noTypeParamsSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = noTypeParamsSchema
+		task.Schema = noTypeParamsSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1502,7 +1639,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		noDimSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = noDimSchema
+		task.Schema = noDimSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1518,7 +1655,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		// Validate default load list
 		skipLoadSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = skipLoadSchema
+		task.Schema = skipLoadSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1536,7 +1673,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		dimNotIntSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = dimNotIntSchema
+		task.Schema = dimNotIntSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1554,7 +1691,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		tooLargeDimSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = tooLargeDimSchema
+		task.Schema = tooLargeDimSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1568,7 +1705,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		}
 		binaryTooLargeDimSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = binaryTooLargeDimSchema
+		task.Schema = binaryTooLargeDimSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1591,7 +1728,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		})
 		twoVecFieldsSchema, err := proto.Marshal(schema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = twoVecFieldsSchema
+		task.Schema = twoVecFieldsSchema
 		err = task.PreExecute(ctx)
 		if enableMultipleVectorFields {
 			assert.NoError(t, err)
@@ -1607,7 +1744,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		// Test valid StructArrayField
 		validStructSchema, err := proto.Marshal(structArrayFieldSchema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = validStructSchema
+		task.Schema = validStructSchema
 		err = task.PreExecute(ctx)
 		assert.NoError(t, err)
 
@@ -1616,7 +1753,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		invalidStructSchema.StructArrayFields[0].Fields = []*schemapb.FieldSchema{} // Empty fields
 		invalidStructSchemaBytes, err := proto.Marshal(invalidStructSchema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = invalidStructSchemaBytes
+		task.Schema = invalidStructSchemaBytes
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1625,7 +1762,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		invalidStructSchema2.StructArrayFields[0].Fields[0].Name = "$invalid" // Invalid field name
 		invalidStructSchema2Bytes, err := proto.Marshal(invalidStructSchema2)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = invalidStructSchema2Bytes
+		task.Schema = invalidStructSchema2Bytes
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1634,7 +1771,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		invalidStructSchema3.StructArrayFields[0].Fields[0].DataType = schemapb.DataType_Int64 // Should be Array or ArrayOfVector
 		invalidStructSchema3Bytes, err := proto.Marshal(invalidStructSchema3)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Schema = invalidStructSchema3Bytes
+		task.Schema = invalidStructSchema3Bytes
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
 
@@ -1643,9 +1780,9 @@ func TestCreateCollectionTask(t *testing.T) {
 		// Test invalid ttl field - ttl field not found
 		ttlFieldSchemaBytes, err := proto.Marshal(ttlFieldSchema)
 		assert.NoError(t, err)
-		task.CreateCollectionRequest.Properties = make([]*commonpb.KeyValuePair, 0)
-		task.CreateCollectionRequest.Schema = ttlFieldSchemaBytes
-		task.CreateCollectionRequest.Properties = append(task.CreateCollectionRequest.Properties, &commonpb.KeyValuePair{
+		task.Properties = make([]*commonpb.KeyValuePair, 0)
+		task.Schema = ttlFieldSchemaBytes
+		task.Properties = append(task.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLFieldKey,
 			Value: "invalid",
 		})
@@ -1654,12 +1791,12 @@ func TestCreateCollectionTask(t *testing.T) {
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 
 		// Test invalid ttl field - exist with collection ttl
-		task.CreateCollectionRequest.Properties = make([]*commonpb.KeyValuePair, 0)
-		task.CreateCollectionRequest.Properties = append(task.CreateCollectionRequest.Properties, &commonpb.KeyValuePair{
+		task.Properties = make([]*commonpb.KeyValuePair, 0)
+		task.Properties = append(task.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLFieldKey,
 			Value: testTTLField,
 		})
-		task.CreateCollectionRequest.Properties = append(task.CreateCollectionRequest.Properties, &commonpb.KeyValuePair{
+		task.Properties = append(task.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLConfigKey,
 			Value: "100",
 		})
@@ -1668,8 +1805,8 @@ func TestCreateCollectionTask(t *testing.T) {
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 
 		// Test invalid ttl field - ttl field is not timestamptz
-		task.CreateCollectionRequest.Properties = make([]*commonpb.KeyValuePair, 0)
-		task.CreateCollectionRequest.Properties = append(task.CreateCollectionRequest.Properties, &commonpb.KeyValuePair{
+		task.Properties = make([]*commonpb.KeyValuePair, 0)
+		task.Properties = append(task.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLFieldKey,
 			Value: "pk",
 		})
@@ -1780,6 +1917,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 		return &schemapb.CollectionSchema{
 			Name:           collectionName,
 			ExternalSource: "s3://bucket/prefix",
+			ExternalSpec:   `{"format":"parquet"}`,
 			Fields: []*schemapb.FieldSchema{
 				{
 					FieldID:       1,
@@ -1827,6 +1965,29 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 		require.NoError(t, err)
 	})
 
+	t.Run("source spec without external field rejected", func(t *testing.T) {
+		schema := buildExternalSchema()
+		for _, field := range schema.GetFields() {
+			field.ExternalField = ""
+		}
+		freshTask := &createCollectionTask{
+			Condition: NewTaskCondition(ctx),
+			CreateCollectionRequest: &milvuspb.CreateCollectionRequest{
+				CollectionName: collectionName,
+				Schema:         marshal(schema),
+				ShardsNum:      common.DefaultShardsNum,
+			},
+			ctx:      ctx,
+			mixCoord: mix,
+		}
+		err := freshTask.OnEnqueue()
+		require.NoError(t, err)
+		err = freshTask.PreExecute(ctx)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.Contains(t, err.Error(), "external_field mappings")
+	})
+
 	t.Run("virtual PK injected after PreExecute", func(t *testing.T) {
 		schema := buildExternalSchema()
 		freshTask := &createCollectionTask{
@@ -1857,7 +2018,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("functions forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.Functions = []*schemapb.FunctionSchema{{Name: "test_func"}}
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "does not support functions")
@@ -1866,7 +2027,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("dynamic field forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.EnableDynamicField = true
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1874,7 +2035,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("primary key forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.Fields[0].IsPrimaryKey = true
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1882,7 +2043,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("partition key forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.Fields[0].IsPartitionKey = true
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1890,7 +2051,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("clustering key forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.Fields[0].IsClusteringKey = true
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1898,7 +2059,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 	t.Run("auto id forbidden", func(t *testing.T) {
 		schema := buildExternalSchema()
 		schema.Fields[0].AutoID = true
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1909,7 +2070,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 			Key:   "enable_match",
 			Value: "true",
 		})
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -1933,7 +2094,7 @@ func TestCreateCollectionTaskExternalCollection(t *testing.T) {
 				},
 			},
 		}
-		task.CreateCollectionRequest.Schema = marshal(schema)
+		task.Schema = marshal(schema)
 		err := task.PreExecute(ctx)
 		assert.Error(t, err)
 	})
@@ -2300,6 +2461,68 @@ func TestDescribeCollectionTask_FilterNamespaceField(t *testing.T) {
 	assert.Equal(t, collectionName, task.result.GetCollectionName())
 }
 
+// Security regression: DescribeCollection must redact credentials embedded in
+// ExternalSpec.extfs (access_key_id / access_key_value / ssl_ca_cert) before
+// returning to the client. Any caller with Describe privilege would otherwise
+// be able to read another tenant's object-storage credentials out of the
+// persisted collection metadata.
+func TestDescribeCollectionTask_RedactsExternalSpecCredentials(t *testing.T) {
+	mix := NewMixCoordMock()
+	ctx := context.Background()
+	InitMetaCache(ctx, mix)
+
+	collectionName := "TestDescribeCollectionTask_RedactsExternalSpecCredentials"
+
+	rawSpec := `{"format":"parquet","extfs":{"access_key_id":"AKIAEXAMPLE","access_key_value":"SUPERSECRET","region":"us-east-1"}}`
+
+	schema := &schemapb.CollectionSchema{
+		Name:           collectionName,
+		ExternalSource: "s3://my-bucket/data/",
+		ExternalSpec:   rawSpec,
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:      common.StartOfUserFieldID,
+				Name:         "id",
+				IsPrimaryKey: true,
+				DataType:     schemapb.DataType_Int64,
+			},
+		},
+	}
+
+	mix.SetDescribeCollectionFunc(func(ctx context.Context, request *milvuspb.DescribeCollectionRequest) (*milvuspb.DescribeCollectionResponse, error) {
+		return &milvuspb.DescribeCollectionResponse{
+			Status:       merr.Success(),
+			Schema:       schema,
+			CollectionID: 1,
+		}, nil
+	})
+
+	task := &describeCollectionTask{
+		Condition: NewTaskCondition(ctx),
+		DescribeCollectionRequest: &milvuspb.DescribeCollectionRequest{
+			Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_DescribeCollection},
+			CollectionName: collectionName,
+		},
+		ctx:      ctx,
+		mixCoord: mix,
+	}
+
+	assert.NoError(t, task.PreExecute(ctx))
+	assert.NoError(t, task.Execute(ctx))
+
+	// describeCollectionTask now passes ExternalSpec through unredacted —
+	// redaction lives at the public proxy.DescribeCollection edge so both
+	// cached and remote provider paths converge through one sanitizer.
+	// The task-level result must still carry raw creds so that the
+	// post-task wrapper can choose to redact (user-facing) or not
+	// (internal callers, if added later, that need raw spec for FFI).
+	out := task.result.Schema.ExternalSpec
+	assert.Contains(t, out, "AKIAEXAMPLE",
+		"task-level result must carry raw spec; redaction is applied at proxy edge")
+	assert.Contains(t, out, "SUPERSECRET",
+		"task-level result must carry raw spec; redaction is applied at proxy edge")
+}
+
 func TestDescribeCollectionTask_ShardsNum2(t *testing.T) {
 	mix := NewMixCoordMock()
 	ctx := context.Background()
@@ -2405,8 +2628,10 @@ func TestCreatePartitionTask(t *testing.T) {
 
 	// setup global meta cache
 	mockCache.EXPECT().GetCollectionID(mock.Anything, mock.Anything, mock.Anything).Return(100, nil).Once()
-	mockCache.EXPECT().GetPartitionID(mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return(1000, nil).Once()
-	rc.EXPECT().CreatePartition(mock.Anything, mock.Anything).Return(merr.Success(), nil).Once()
+	rc.EXPECT().CreatePartitionV2(mock.Anything, mock.Anything).Return(&rootcoordpb.CreatePartitionResponse{
+		Status:      merr.Success(),
+		PartitionID: 1000,
+	}, nil).Once()
 	rc.EXPECT().SyncNewCreatedPartition(mock.Anything, mock.Anything).Return(merr.Success(), nil).Once()
 	err := task.Execute(ctx)
 	assert.NoError(t, err)
@@ -3505,11 +3730,11 @@ func Test_dropCollectionTask_Execute(t *testing.T) {
 	err := dct.Execute(ctx)
 	assert.NoError(t, err)
 
-	dct.DropCollectionRequest.CollectionName = "c1"
+	dct.CollectionName = "c1"
 	err = dct.Execute(ctx)
 	assert.Error(t, err)
 
-	dct.DropCollectionRequest.CollectionName = "c2"
+	dct.CollectionName = "c2"
 	err = dct.Execute(ctx)
 	assert.Error(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, dct.result.GetErrorCode())
@@ -3521,18 +3746,69 @@ func Test_dropCollectionTask_PostExecute(t *testing.T) {
 }
 
 func Test_truncateCollectionTask_PreExecute(t *testing.T) {
-	tct := &truncateCollectionTask{TruncateCollectionRequest: &milvuspb.TruncateCollectionRequest{
-		Base:           &commonpb.MsgBase{},
-		CollectionName: "valid",
-	}}
+	mix := NewMixCoordMock()
 	ctx := context.Background()
-	err := tct.PreExecute(ctx)
-	assert.NoError(t, err)
+	require.NoError(t, InitMetaCache(ctx, mix))
 
-	// Test invalid collection name
-	tct.CollectionName = "#0xc0de"
-	err = tct.PreExecute(ctx)
-	assert.Error(t, err)
+	dbName := ""
+	regularName := "regular_truncate_" + funcutil.GenRandomStr()
+	externalName := "ext_truncate_" + funcutil.GenRandomStr()
+
+	regularSchema := constructCollectionSchema("pk", "fvec", 4, regularName)
+	regBytes, err := proto.Marshal(regularSchema)
+	require.NoError(t, err)
+	_, err = mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		Base:   &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+		DbName: dbName, CollectionName: regularName, Schema: regBytes, ShardsNum: 1,
+	})
+	require.NoError(t, err)
+
+	extSchema := &schemapb.CollectionSchema{
+		Name:           externalName,
+		ExternalSource: "s3://bucket/path/",
+		ExternalSpec:   `{"format":"parquet"}`,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 100, Name: "id", DataType: schemapb.DataType_Int64, IsPrimaryKey: true, ExternalField: "id"},
+			{
+				FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector, ExternalField: "vec",
+				TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "4"}},
+			},
+		},
+	}
+	extBytes, err := proto.Marshal(extSchema)
+	require.NoError(t, err)
+	_, err = mix.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+		Base:   &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+		DbName: dbName, CollectionName: externalName, Schema: extBytes, ShardsNum: 1,
+	})
+	require.NoError(t, err)
+
+	t.Run("regular collection passes", func(t *testing.T) {
+		tct := &truncateCollectionTask{TruncateCollectionRequest: &milvuspb.TruncateCollectionRequest{
+			Base: &commonpb.MsgBase{}, DbName: dbName, CollectionName: regularName,
+		}}
+		assert.NoError(t, tct.PreExecute(ctx))
+	})
+
+	t.Run("invalid collection name rejected", func(t *testing.T) {
+		tct := &truncateCollectionTask{TruncateCollectionRequest: &milvuspb.TruncateCollectionRequest{
+			Base: &commonpb.MsgBase{}, CollectionName: "#0xc0de",
+		}}
+		assert.Error(t, tct.PreExecute(ctx))
+	})
+
+	// Truncate is destructive on internal segments and meaningless for
+	// external collections (data lives in user object store). Reject up
+	// front to prevent silent no-op or inconsistent meta state.
+	t.Run("external collection rejected", func(t *testing.T) {
+		tct := &truncateCollectionTask{TruncateCollectionRequest: &milvuspb.TruncateCollectionRequest{
+			Base: &commonpb.MsgBase{}, DbName: dbName, CollectionName: externalName,
+		}}
+		err := tct.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "external collection")
+		assert.Contains(t, err.Error(), "RefreshExternalCollection")
+	})
 }
 
 func Test_truncateCollectionTask_Execute(t *testing.T) {
@@ -3560,11 +3836,11 @@ func Test_truncateCollectionTask_Execute(t *testing.T) {
 	err := tct.Execute(ctx)
 	assert.NoError(t, err)
 
-	tct.TruncateCollectionRequest.CollectionName = "c1"
+	tct.CollectionName = "c1"
 	err = tct.Execute(ctx)
 	assert.Error(t, err)
 
-	tct.TruncateCollectionRequest.CollectionName = "c2"
+	tct.CollectionName = "c2"
 	err = tct.Execute(ctx)
 	assert.Error(t, err)
 	assert.Equal(t, commonpb.ErrorCode_Success, tct.result.GetStatus().GetErrorCode())
@@ -5964,7 +6240,7 @@ func constructCollectionSchemaWithStructArrayField(collectionName string, struct
 				TypeParams: []*commonpb.KeyValuePair{
 					{
 						Key:   common.MaxCapacityKey,
-						Value: "20",
+						Value: "50",
 					},
 				},
 			},
@@ -5980,7 +6256,7 @@ func constructCollectionSchemaWithStructArrayField(collectionName string, struct
 					},
 					{
 						Key:   common.MaxCapacityKey,
-						Value: "5",
+						Value: "50",
 					},
 				},
 			},
@@ -6107,6 +6383,12 @@ func TestCreateCollectionTaskWithStructArrayField(t *testing.T) {
 							Name:        "field_name", // Duplicate name
 							DataType:    schemapb.DataType_Array,
 							ElementType: schemapb.DataType_Int32,
+							TypeParams: []*commonpb.KeyValuePair{
+								{
+									Key:   common.MaxCapacityKey,
+									Value: "100",
+								},
+							},
 						},
 						{
 							FieldID:     1022,
@@ -6116,6 +6398,10 @@ func TestCreateCollectionTaskWithStructArrayField(t *testing.T) {
 							TypeParams: []*commonpb.KeyValuePair{
 								{
 									Key:   common.MaxLengthKey,
+									Value: "100",
+								},
+								{
+									Key:   common.MaxCapacityKey,
 									Value: "100",
 								},
 							},
@@ -6132,12 +6418,24 @@ func TestCreateCollectionTaskWithStructArrayField(t *testing.T) {
 							Name:        "field_name", // Same name as struct1's field
 							DataType:    schemapb.DataType_Array,
 							ElementType: schemapb.DataType_Float,
+							TypeParams: []*commonpb.KeyValuePair{
+								{
+									Key:   common.MaxCapacityKey,
+									Value: "100",
+								},
+							},
 						},
 						{
 							FieldID:     1032,
 							Name:        "common_field", // Same name as struct1's field
 							DataType:    schemapb.DataType_Array,
 							ElementType: schemapb.DataType_Bool,
+							TypeParams: []*commonpb.KeyValuePair{
+								{
+									Key:   common.MaxCapacityKey,
+									Value: "100",
+								},
+							},
 						},
 					},
 				},
@@ -6439,7 +6737,7 @@ func TestHighlightTask(t *testing.T) {
 		assert.NoError(t, err)
 		assert.NotNil(t, task.result)
 		assert.Equal(t, expectedResp, task.result)
-		assert.Equal(t, "test_channel", task.GetHighlightRequest.Channel)
+		assert.Equal(t, "test_channel", task.Channel)
 	})
 
 	t.Run("getHighlightOnShardleader rpc error", func(t *testing.T) {
@@ -6741,6 +7039,19 @@ func TestValidateAddFieldRequest(t *testing.T) {
 		err := validateAddFieldRequest(schema, newField)
 		assert.Error(t, err)
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("external field mapping", func(t *testing.T) {
+		schema := baseSchema()
+		newField := &schemapb.FieldSchema{
+			Name:          "external_field",
+			DataType:      schemapb.DataType_Int64,
+			ExternalField: "remote_field",
+		}
+		err := validateAddFieldRequest(schema, newField)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.Contains(t, err.Error(), "does not support external field mapping")
 	})
 
 	t.Run("system field name RowID", func(t *testing.T) {
@@ -7119,6 +7430,35 @@ func TestAlterCollectionSchemaTask(t *testing.T) {
 		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 	})
 
+	t.Run("PreExecute rejects non-BM25 function with DoPhysicalBackfill", func(t *testing.T) {
+		req := &milvuspb.AlterCollectionSchemaRequest{
+			DbName:         dbName,
+			CollectionName: collectionName,
+			Action: &milvuspb.AlterCollectionSchemaRequest_Action{
+				Op: &milvuspb.AlterCollectionSchemaRequest_Action_AddRequest{
+					AddRequest: &milvuspb.AlterCollectionSchemaRequest_AddRequest{
+						DoPhysicalBackfill: true,
+						FieldInfos: []*milvuspb.AlterCollectionSchemaRequest_FieldInfo{
+							{FieldSchema: sparseOutputField},
+						},
+						FuncSchema: []*schemapb.FunctionSchema{
+							{
+								Name:             "text_embedding_func",
+								Type:             schemapb.FunctionType_TextEmbedding,
+								InputFieldNames:  []string{"text"},
+								OutputFieldNames: []string{"sparse_bm25"},
+							},
+						},
+					},
+				},
+			},
+		}
+		task := buildTask(req, oldSchema)
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
 	t.Run("PreExecute happy path", func(t *testing.T) {
 		task := buildTask(buildValidRequest(), oldSchema)
 		err := task.PreExecute(ctx)
@@ -7160,5 +7500,56 @@ func TestAlterCollectionSchemaTask(t *testing.T) {
 			err = task.Execute(ctx)
 			assert.Error(t, err)
 		})
+	})
+}
+
+// TestAlterCollection_RejectExternalTupleMutation verifies the proxy-layer
+// guard rejects user alter_collection_properties calls that target the
+// external_source / external_spec tuple. Mutation of this tuple is reserved
+// to RefreshExternalCollection; see issue #49335.
+func TestAlterCollection_RejectExternalTupleMutation(t *testing.T) {
+	ctx := context.Background()
+	task := &alterCollectionTask{
+		AlterCollectionRequest: &milvuspb.AlterCollectionRequest{
+			Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_AlterCollection},
+			DbName:         dbName,
+			CollectionName: "ext_guard_test",
+		},
+	}
+
+	t.Run("reject properties with external_source", func(t *testing.T) {
+		task.Properties = []*commonpb.KeyValuePair{
+			{Key: common.CollectionExternalSource, Value: "s3://bucket/a/"},
+		}
+		task.DeleteKeys = nil
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "RefreshExternalCollection")
+	})
+
+	t.Run("reject properties with external_spec", func(t *testing.T) {
+		task.Properties = []*commonpb.KeyValuePair{
+			{Key: common.CollectionExternalSpec, Value: `{"format":"parquet"}`},
+		}
+		task.DeleteKeys = nil
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "RefreshExternalCollection")
+	})
+
+	t.Run("reject delete of external_source", func(t *testing.T) {
+		task.Properties = nil
+		task.DeleteKeys = []string{common.CollectionExternalSource}
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "immutable")
+	})
+
+	t.Run("reject delete of external_spec", func(t *testing.T) {
+		task.Properties = nil
+		task.DeleteKeys = []string{common.CollectionExternalSpec}
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "immutable")
 	})
 }

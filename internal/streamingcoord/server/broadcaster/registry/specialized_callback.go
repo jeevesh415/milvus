@@ -1,9 +1,9 @@
 package registry
 
 import (
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 )
 
 // init the message ack callbacks
@@ -67,9 +67,10 @@ var (
 	RegisterDropResourceGroupV2AckCallback  = registerMessageAckCallback[*message.DropResourceGroupMessageHeader, *message.DropResourceGroupMessageBody]
 
 	// Snapshot
-	RegisterCreateSnapshotV2AckCallback  = registerMessageAckCallback[*message.CreateSnapshotMessageHeader, *message.CreateSnapshotMessageBody]
-	RegisterDropSnapshotV2AckCallback    = registerMessageAckCallback[*message.DropSnapshotMessageHeader, *message.DropSnapshotMessageBody]
-	RegisterRestoreSnapshotV2AckCallback = registerMessageAckCallback[*message.RestoreSnapshotMessageHeader, *message.RestoreSnapshotMessageBody]
+	RegisterCreateSnapshotV2AckCallback            = registerMessageAckCallback[*message.CreateSnapshotMessageHeader, *message.CreateSnapshotMessageBody]
+	RegisterDropSnapshotV2AckCallback              = registerMessageAckCallback[*message.DropSnapshotMessageHeader, *message.DropSnapshotMessageBody]
+	RegisterRestoreSnapshotV2AckCallback           = registerMessageAckCallback[*message.RestoreSnapshotMessageHeader, *message.RestoreSnapshotMessageBody]
+	RegisterDropSnapshotsByCollectionV2AckCallback = registerMessageAckCallback[*message.DropSnapshotsByCollectionMessageHeader, *message.DropSnapshotsByCollectionMessageBody]
 
 	// External Collection
 	RegisterRefreshExternalCollectionV2AckCallback = registerMessageAckCallback[*message.RefreshExternalCollectionMessageHeader, *message.RefreshExternalCollectionMessageBody]
@@ -77,6 +78,8 @@ var (
 
 // resetMessageAckCallbacks resets the message ack callbacks.
 func resetMessageAckCallbacks() {
+	messageAckCallbacksMu.Lock()
+	defer messageAckCallbacksMu.Unlock()
 	messageAckCallbacks = map[message.MessageTypeWithVersion]*syncutil.Future[messageInnerAckCallback]{
 		message.MessageTypeImportV1:              syncutil.NewFuture[messageInnerAckCallback](),
 		message.MessageTypeBatchUpdateManifestV2: syncutil.NewFuture[messageInnerAckCallback](),
@@ -130,9 +133,10 @@ func resetMessageAckCallbacks() {
 		message.MessageTypeDropResourceGroupV2:  syncutil.NewFuture[messageInnerAckCallback](),
 
 		// Snapshot
-		message.MessageTypeCreateSnapshotV2:  syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeDropSnapshotV2:    syncutil.NewFuture[messageInnerAckCallback](),
-		message.MessageTypeRestoreSnapshotV2: syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeCreateSnapshotV2:            syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeDropSnapshotV2:              syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeRestoreSnapshotV2:           syncutil.NewFuture[messageInnerAckCallback](),
+		message.MessageTypeDropSnapshotsByCollectionV2: syncutil.NewFuture[messageInnerAckCallback](),
 
 		// External Collection
 		message.MessageTypeRefreshExternalCollectionV2: syncutil.NewFuture[messageInnerAckCallback](),

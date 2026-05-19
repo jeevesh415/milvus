@@ -9,11 +9,11 @@ import (
 
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/balancer/balance"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 var StaticStreamingNodeManager = newStreamingNodeManager()
@@ -65,9 +65,10 @@ func (s *StreamingReadyNotifier) IsReady() bool {
 type StreamingNodeManager struct {
 	notifier            *syncutil.AsyncTaskNotifier[struct{}]
 	cond                *syncutil.ContextCond
-	latestAssignments   map[string]types.PChannelInfoAssigned // The latest assignments info got from streaming coord balance module.
-	nodeChangedNotifier *syncutil.VersionedNotifier           // used to notify that node in streaming node manager has been changed.
-	previousNodeIDs     typeutil.UniqueSet                    // used to store the previous node ids.
+	latestAssignments   map[string]types.PChannelInfoAssigned               // The latest assignments info got from streaming coord balance module.
+	nodeChangedNotifier *syncutil.VersionedNotifier                         // used to notify that node in streaming node manager has been changed.
+	nodesMu             sync.Mutex                                          // protects previousNodesByRG from concurrent access.
+	previousNodesByRG   map[int64]*types.StreamingNodeInfoWithResourceGroup // used to store the previous nodes by resource group.
 }
 
 // GetBalancer returns the balancer of the streaming node manager.
@@ -146,22 +147,50 @@ func (s *StreamingNodeManager) GetWALLocated(vChannel string) int64 {
 
 // GetStreamingQueryNodeIDs returns the server ids of the streaming query nodes.
 func (s *StreamingNodeManager) GetStreamingQueryNodeIDs() typeutil.UniqueSet {
+	streamingNodes := s.fetchStreamingNodes()
+	streamingNodeIDs := typeutil.NewUniqueSet()
+	for _, streamingNode := range streamingNodes {
+		streamingNodeIDs.Insert(streamingNode.ServerID)
+	}
+	return streamingNodeIDs
+}
+
+// GetStreamingQueryNodeIDsByResourceGroup returns the server ids of the streaming query nodes grouped by resource group.
+func (s *StreamingNodeManager) GetStreamingQueryNodeIDsByResourceGroup() map[string]typeutil.UniqueSet {
+	streamingNodes := s.fetchStreamingNodes()
+	nodesByRG := make(map[string]typeutil.UniqueSet)
+	for _, node := range streamingNodes {
+		if _, ok := nodesByRG[node.ResourceGroup]; !ok {
+			nodesByRG[node.ResourceGroup] = typeutil.NewUniqueSet()
+		}
+		nodesByRG[node.ResourceGroup].Insert(node.ServerID)
+	}
+	return nodesByRG
+}
+
+// fetchStreamingNodes fetches all streaming nodes from balancer, falling back to cached nodes on error.
+// The result is cached for use during shutdown when the balancer may not be available.
+func (s *StreamingNodeManager) fetchStreamingNodes() map[int64]*types.StreamingNodeInfoWithResourceGroup {
 	balancer, err := balance.GetWithContext(context.Background())
 	if err != nil {
 		panic(err)
 	}
 	streamingNodes, err := balancer.GetAvailableStreamingNodes(context.Background())
+
+	s.nodesMu.Lock()
+	defer s.nodesMu.Unlock()
 	if err != nil {
 		// when the streaming coord is on shutdown, the balancer will return an error,
-		// causing panic, so we need to return the previous node ids.
-		return s.previousNodeIDs
+		// causing panic, so we need to return the previous nodes.
+		streamingNodes = s.previousNodesByRG
 	}
-	streamingNodeIDs := typeutil.NewUniqueSet()
-	for _, streamingNode := range streamingNodes {
-		streamingNodeIDs.Insert(streamingNode.ServerID)
+	// Deep copy into cache to prevent callers from mutating the cached map.
+	s.previousNodesByRG = make(map[int64]*types.StreamingNodeInfoWithResourceGroup, len(streamingNodes))
+	for k, v := range streamingNodes {
+		copied := *v
+		s.previousNodesByRG[k] = &copied
 	}
-	s.previousNodeIDs = streamingNodeIDs
-	return streamingNodeIDs
+	return streamingNodes
 }
 
 // ListenNodeChanged returns a listener for node changed event.

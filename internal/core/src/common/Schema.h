@@ -142,7 +142,8 @@ class Schema {
     AddDebugVectorArrayField(const std::string& name,
                              DataType element_type,
                              int64_t dim,
-                             std::optional<knowhere::MetricType> metric_type) {
+                             std::optional<knowhere::MetricType> metric_type,
+                             bool nullable = false) {
         auto field_id = FieldId(debug_id);
         debug_id++;
         auto field_meta = FieldMeta(FieldName(name),
@@ -150,7 +151,8 @@ class Schema {
                                     DataType::VECTOR_ARRAY,
                                     element_type,
                                     dim,
-                                    metric_type);
+                                    metric_type,
+                                    nullable);
         this->AddField(std::move(field_meta));
         return field_id;
     }
@@ -399,13 +401,10 @@ class Schema {
     const ArrowSchemaPtr
     ConvertToLoonArrowSchema() const;
 
-    // Build an Arrow schema suitable for reading data from storage.
-    // Normal collections: same as ConvertToArrowSchema().
-    // External collections: filtered to external fields only, using
-    // parquet column names with ARROW_FIELD_ID_KEY metadata for
-    // downstream field ID resolution.
-    const ArrowSchemaPtr
-    BuildReaderArrowSchema() const;
+    // Get the list of external column names (parquet column names) for
+    // external collections. Used as needed_columns for schemaless Reader.
+    std::shared_ptr<std::vector<std::string>>
+    GetExternalColumnNames() const;
 
     // Resolve a column group column name to a FieldId.
     // Normal collections: column name is the numeric field ID string.

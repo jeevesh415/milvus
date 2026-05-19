@@ -15,14 +15,14 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/discoverer"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/service/resolver"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/types"
-	"github.com/milvus-io/milvus/pkg/v2/util/contextutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/replicateutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/syncutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
+	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/replicateutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 const (
@@ -116,25 +116,65 @@ func (b *balancerImpl) ReplicateRole() replicateutil.Role {
 	return b.channelMetaManager.ReplicateRole()
 }
 
-// GetAllStreamingNodes fetches all streaming node info (including frozen nodes).
-func (b *balancerImpl) GetAllStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error) {
+// GetAllStreamingNodes fetches all streaming node info with resource group (including frozen nodes).
+func (b *balancerImpl) GetAllStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfoWithResourceGroup, error) {
 	return resource.Resource().StreamingNodeManagerClient().GetAllStreamingNodes(ctx)
 }
 
-// GetAvailableStreamingNodes fetches streaming node info excluding frozen nodes.
-func (b *balancerImpl) GetAvailableStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfo, error) {
+// GetAvailableStreamingNodes fetches streaming node info with resource group excluding frozen nodes.
+func (b *balancerImpl) GetAvailableStreamingNodes(ctx context.Context) (map[int64]*types.StreamingNodeInfoWithResourceGroup, error) {
 	nodes, err := resource.Resource().StreamingNodeManagerClient().GetAllStreamingNodes(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	filtered := make(map[int64]*types.StreamingNodeInfo, len(nodes))
+	filtered := make(map[int64]*types.StreamingNodeInfoWithResourceGroup, len(nodes))
 	for nodeID, info := range nodes {
 		if !b.freezeNodes.Contain(nodeID) {
 			filtered[nodeID] = info
 		}
 	}
 	return filtered, nil
+}
+
+// ConfirmPrimaryResourceGroupReady returns nil iff every RW pchannel is currently
+// assigned to a streaming node that belongs to the configured primary resource group.
+// If streaming.primaryResourceGroup is not configured, returns nil.
+func (b *balancerImpl) ConfirmPrimaryResourceGroupReady(ctx context.Context) error {
+	if !b.lifetime.Add(typeutil.LifetimeStateWorking) {
+		return status.NewOnShutdownError("balancer is closing")
+	}
+	defer b.lifetime.Done()
+
+	primaryRG := paramtable.Get().StreamingCfg.PrimaryResourceGroup.GetValue()
+	if primaryRG == "" {
+		return nil
+	}
+	nodes, err := resource.Resource().StreamingNodeManagerClient().GetAllStreamingNodes(ctx)
+	if err != nil {
+		return err
+	}
+	assignment, err := b.channelMetaManager.GetLatestChannelAssignment()
+	if err != nil {
+		return err
+	}
+	for _, rel := range assignment.Relations {
+		// Only RW pchannels carry WAL writes; RO pchannels (e.g., CDC source) are
+		// not constrained by the local primary RG.
+		if rel.Channel.AccessMode != types.AccessModeRW {
+			continue
+		}
+		node, ok := nodes[rel.Node.ServerID]
+		if !ok {
+			return status.NewInner("pchannel %s: assigned node %d not found in streaming nodes",
+				rel.Channel.Name, rel.Node.ServerID)
+		}
+		if node.ResourceGroup != primaryRG {
+			return status.NewInner("pchannel %s still on rg=%s, expected primary rg=%s (WAL migration in progress)",
+				rel.Channel.Name, node.ResourceGroup, primaryRG)
+		}
+	}
+	return nil
 }
 
 // GetLatestWALLocated returns the server id of the node that the wal of the vChannel is located.
@@ -498,8 +538,9 @@ func (b *balancerImpl) balance(ctx context.Context) (bool, error) {
 	b.Logger().Info("start to balance")
 	pchannelView := b.channelMetaManager.CurrentPChannelsView()
 
-	b.Logger().Info("collect all status...")
-	nodeStatus, err := b.fetchStreamingNodeStatus(ctx)
+	rgName := paramtable.Get().StreamingCfg.PrimaryResourceGroup.GetValue()
+	b.Logger().Info("collect all status...", zap.String("resourceGroupHint", rgName))
+	nodeStatus, err := b.fetchStreamingNodeStatus(ctx, rgName)
 	if err != nil {
 		return false, err
 	}
@@ -530,8 +571,8 @@ func (b *balancerImpl) balance(ctx context.Context) (bool, error) {
 }
 
 // fetchStreamingNodeStatus fetch the streaming node status.
-func (b *balancerImpl) fetchStreamingNodeStatus(ctx context.Context) (map[int64]*types.StreamingNodeStatus, error) {
-	nodeStatus, err := resource.Resource().StreamingNodeManagerClient().CollectAllStatus(ctx)
+func (b *balancerImpl) fetchStreamingNodeStatus(ctx context.Context, rgName string) (map[int64]*types.StreamingNodeStatus, error) {
+	nodeStatus, err := resource.Resource().StreamingNodeManagerClient().CollectAllStatus(ctx, rgName)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to collect all status")
 	}

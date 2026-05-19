@@ -23,21 +23,21 @@ import (
 	"github.com/cockroachdb/errors"
 	"go.uber.org/zap"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
 	"github.com/milvus-io/milvus/internal/distributed/streaming"
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/proxypb"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message"
-	"github.com/milvus-io/milvus/pkg/v2/streaming/util/message/ce"
-	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/proxypb"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message"
+	"github.com/milvus-io/milvus/pkg/v3/streaming/util/message/ce"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.DropCollectionRequest) error {
@@ -61,7 +61,7 @@ func (c *Core) broadcastDropCollectionV1(ctx context.Context, req *milvuspb.Drop
 	msg := message.NewDropCollectionMessageBuilderV1().
 		WithHeader(dropCollectionTask.header).
 		WithBody(dropCollectionTask.body).
-		WithBroadcast(channels).
+		WithBroadcast(channels, message.OptBuildBroadcastAckSyncUp()).
 		MustBuildBroadcast()
 	if _, err := broadcaster.Broadcast(ctx, msg); err != nil {
 		return err
@@ -109,6 +109,23 @@ func (c *DDLCallback) dropCollectionV1AckCallback(ctx context.Context, result me
 				streaming.WAL().ControlChannel(): result,
 			}); err != nil {
 				return errors.Wrap(err, "failed to drop collection index")
+			}
+
+			// 2.5. best-effort drop all snapshots of this collection
+			dropSnapshotsMsg := message.NewDropSnapshotsByCollectionMessageBuilderV2().
+				WithHeader(&message.DropSnapshotsByCollectionMessageHeader{
+					CollectionId: collectionID,
+				}).
+				WithBody(&message.DropSnapshotsByCollectionMessageBody{}).
+				WithBroadcast([]string{streaming.WAL().ControlChannel()}).
+				MustBuildBroadcast().
+				WithBroadcastID(msg.BroadcastHeader().BroadcastID)
+
+			if err := registry.CallMessageAckCallback(ctx, dropSnapshotsMsg, map[string]*message.AppendResult{
+				streaming.WAL().ControlChannel(): result,
+			}); err != nil {
+				log.Ctx(ctx).Warn("best-effort drop collection snapshots failed, will be cleaned up by GC",
+					zap.Int64("collectionID", collectionID), zap.Error(err))
 			}
 
 			// 3. drop the collection meta itself.

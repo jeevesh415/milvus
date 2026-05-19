@@ -3,6 +3,7 @@ package parquet
 import (
 	"context"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"strings"
@@ -16,14 +17,14 @@ import (
 	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 	"github.com/stretchr/testify/assert"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/storage"
 	"github.com/milvus-io/milvus/internal/util/testutil"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/objectstorage"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/objectstorage"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 func init() {
@@ -87,6 +88,80 @@ func TestInvalidUTF8(t *testing.T) {
 	_, err = reader.Read()
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "contains invalid UTF-8 data"))
+}
+
+func TestConvertToArrowDataType_Text(t *testing.T) {
+	field := &schemapb.FieldSchema{
+		FieldID:  100,
+		Name:     "text_field",
+		DataType: schemapb.DataType_Text,
+		// TEXT has no TypeParams (no max_length)
+	}
+	arrowType, err := convertToArrowDataType(field, false)
+	assert.NoError(t, err)
+	assert.Equal(t, arrow.STRING, arrowType.ID())
+}
+
+func TestReadTextFieldData(t *testing.T) {
+	const (
+		fieldID = int64(100)
+		numRows = 10
+	)
+
+	schema := &schemapb.CollectionSchema{
+		Fields: []*schemapb.FieldSchema{
+			{
+				FieldID:  fieldID,
+				Name:     "text",
+				DataType: schemapb.DataType_Text,
+				// no TypeParams — TEXT has no max_length
+			},
+		},
+	}
+
+	data := make([]string, numRows)
+	for i := 0; i < numRows; i++ {
+		data[i] = fmt.Sprintf("text_content_%d_with_longer_payload_for_testing", i)
+	}
+
+	filePath := fmt.Sprintf("/tmp/test_%d_text_reader.parquet", rand.Int())
+	defer os.Remove(filePath)
+	wf, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, 0o666)
+	assert.NoError(t, err)
+
+	pqSchema, err := ConvertToArrowSchemaForUT(schema, false)
+	assert.NoError(t, err)
+	fw, err := pqarrow.NewFileWriter(pqSchema, wf,
+		parquet.NewWriterProperties(parquet.WithMaxRowGroupLength(int64(numRows))), pqarrow.DefaultWriterProps())
+	assert.NoError(t, err)
+
+	builder := array.NewStringBuilder(memory.DefaultAllocator)
+	defer builder.Release()
+	for _, v := range data {
+		builder.Append(v)
+	}
+	arr := builder.NewArray()
+	defer arr.Release()
+
+	recordBatch := array.NewRecord(pqSchema, []arrow.Array{arr}, int64(numRows))
+	defer recordBatch.Release()
+	err = fw.Write(recordBatch)
+	assert.NoError(t, err)
+	fw.Close()
+
+	ctx := context.Background()
+	f := storage.NewChunkManagerFactory("local", objectstorage.RootPath(testOutputPath))
+	cm, err := f.NewPersistentStorageChunkManager(ctx)
+	assert.NoError(t, err)
+	reader, err := NewReader(ctx, cm, schema, filePath, 64*1024*1024)
+	assert.NoError(t, err)
+	assert.NotNil(t, reader)
+	defer reader.Close()
+
+	insertData, err := reader.Read()
+	assert.NoError(t, err)
+	assert.NotNil(t, insertData)
+	assert.Equal(t, numRows, insertData.Data[fieldID].RowNum())
 }
 
 // TestParseSparseFloatRowVector tests the parseSparseFloatRowVector function
@@ -883,4 +958,94 @@ func TestStructFieldReader_toScalarField_TypeMismatch(t *testing.T) {
 			assert.Contains(t, err.Error(), "expected")
 		})
 	}
+}
+
+func TestStructFieldReader_NullableArrayOfVector(t *testing.T) {
+	mem := memory.NewGoAllocator()
+	structType := arrow.StructOf(arrow.Field{
+		Name:     "vector_array",
+		Type:     arrow.ListOf(arrow.PrimitiveTypes.Float32),
+		Nullable: true,
+	})
+	listBuilder := array.NewListBuilder(mem, structType)
+	structBuilder := listBuilder.ValueBuilder().(*array.StructBuilder)
+	vectorBuilder := structBuilder.FieldBuilder(0).(*array.ListBuilder)
+	floatBuilder := vectorBuilder.ValueBuilder().(*array.Float32Builder)
+
+	appendVector := func(values ...float32) {
+		vectorBuilder.Append(true)
+		floatBuilder.AppendValues(values, nil)
+		structBuilder.Append(true)
+	}
+	listBuilder.Append(true)
+	appendVector(1, 2, 3, 4)
+	appendVector(5, 6, 7, 8)
+	listBuilder.Append(false)
+	listBuilder.Append(true)
+	appendVector(9, 10, 11, 12)
+
+	arr := listBuilder.NewArray()
+	listBuilder.Release()
+	defer arr.Release()
+
+	chunked := arrow.NewChunked(arr.DataType(), []arrow.Array{arr})
+	defer chunked.Release()
+
+	reader := &StructFieldReader{
+		field: &schemapb.FieldSchema{
+			Name:        "struct_array[vector_array]",
+			DataType:    schemapb.DataType_ArrayOfVector,
+			ElementType: schemapb.DataType_FloatVector,
+			Nullable:    true,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.MaxCapacityKey, Value: "20"},
+			},
+		},
+		fieldIndex: 0,
+		dim:        4,
+	}
+
+	data, validData, err := reader.readArrayOfVectorField(chunked)
+	assert.NoError(t, err)
+
+	rows := data.([]*schemapb.VectorField)
+	assert.Equal(t, 3, len(rows))
+	assert.Equal(t, []bool{true, false, true}, validData.([]bool))
+	assert.Equal(t, []float32{1, 2, 3, 4, 5, 6, 7, 8}, rows[0].GetFloatVector().GetData())
+	assert.Empty(t, rows[1].GetFloatVector().GetData())
+	assert.Equal(t, []float32{9, 10, 11, 12}, rows[2].GetFloatVector().GetData())
+}
+
+func TestBuildVectorArrayFieldRejectsInvalidFloat(t *testing.T) {
+	field := &schemapb.FieldSchema{
+		Name:        "struct_array[vector_array]",
+		DataType:    schemapb.DataType_ArrayOfVector,
+		ElementType: schemapb.DataType_FloatVector,
+	}
+
+	t.Run("list format", func(t *testing.T) {
+		mem := memory.NewGoAllocator()
+		vectorBuilder := array.NewListBuilder(mem, arrow.PrimitiveTypes.Float32)
+		floatBuilder := vectorBuilder.ValueBuilder().(*array.Float32Builder)
+		vectorBuilder.Append(true)
+		floatBuilder.AppendValues([]float32{1, float32(math.NaN()), 3, 4}, nil)
+		vectors := vectorBuilder.NewArray().(*array.List)
+		vectorBuilder.Release()
+		defer vectors.Release()
+
+		_, err := buildVectorArrayFieldFromList(field, 4, vectors, 0, 1)
+		assert.Error(t, err)
+	})
+
+	t.Run("fixed size binary format", func(t *testing.T) {
+		mem := memory.NewGoAllocator()
+		builder := array.NewFixedSizeBinaryBuilder(mem, &arrow.FixedSizeBinaryType{ByteWidth: 16})
+		builder.Append(arrow.Float32Traits.CastToBytes([]float32{1, float32(math.Inf(1)), 3, 4}))
+		vectors := builder.NewArray().(*array.FixedSizeBinary)
+		builder.Release()
+		defer vectors.Release()
+
+		_, err := buildVectorArrayFieldFromFixedSizeBinary(field, 4, vectors, 0, 1)
+		assert.Error(t, err)
+	})
 }

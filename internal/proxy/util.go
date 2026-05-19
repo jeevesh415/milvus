@@ -33,9 +33,9 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/agg"
 	"github.com/milvus-io/milvus/internal/json"
 	"github.com/milvus-io/milvus/internal/parser/planparserv2"
@@ -47,23 +47,23 @@ import (
 	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/internal/util/segcore"
 	typeutil2 "github.com/milvus-io/milvus/internal/util/typeutil"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
-	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/planpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/util"
-	"github.com/milvus-io/milvus/pkg/v2/util/commonpbutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/contextutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/crypto"
-	"github.com/milvus-io/milvus/pkg/v2/util/funcutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/merr"
-	"github.com/milvus-io/milvus/pkg/v2/util/metric"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/timestamptz"
-	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/util"
+	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/contextutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
+	"github.com/milvus-io/milvus/pkg/v3/util/metric"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/timestamptz"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 const (
@@ -424,7 +424,9 @@ func validateDimension(field *schemapb.FieldSchema) error {
 	}
 
 	// for dense vector field, dim will be limited by max_dimension
-	if typeutil.IsBinaryVectorType(field.DataType) {
+	isBinaryDimension := typeutil.IsBinaryVectorType(field.DataType) ||
+		(field.GetDataType() == schemapb.DataType_ArrayOfVector && typeutil.IsBinaryVectorType(field.GetElementType()))
+	if isBinaryDimension {
 		if dim%8 != 0 {
 			return fmt.Errorf("invalid dimension: %d of field %s. binary vector dimension should be multiple of 8. ", dim, field.GetName())
 		}
@@ -471,25 +473,35 @@ func validateMaxLengthPerRow(collectionName string, field *schemapb.FieldSchema)
 	return nil
 }
 
-func validateMaxCapacityPerRow(collectionName string, field *schemapb.FieldSchema) error {
+func getMaxCapacityPerRow(collectionName string, field *schemapb.FieldSchema) (int64, error) {
 	exist := false
+	var maxCapacityPerRow int64
 	for _, param := range field.TypeParams {
 		if param.Key != common.MaxCapacityKey {
 			continue
 		}
 
-		maxCapacityPerRow, err := strconv.ParseInt(param.Value, 10, 64)
+		var err error
+		maxCapacityPerRow, err = strconv.ParseInt(param.Value, 10, 64)
 		if err != nil {
-			return fmt.Errorf("the value for %s of field %s must be an integer", common.MaxCapacityKey, field.GetName())
+			return 0, fmt.Errorf("the value for %s of field %s must be an integer", common.MaxCapacityKey, field.GetName())
 		}
 		if maxCapacityPerRow > defaultMaxArrayCapacity || maxCapacityPerRow <= 0 {
-			return errors.New("the maximum capacity specified for a Array should be in (0, 4096]")
+			return 0, errors.New("the maximum capacity specified for a Array should be in (0, 4096]")
 		}
 		exist = true
 	}
-	// if not exist type params max_length, return error
+	// if not exist type params max_capacity, return error
 	if !exist {
-		return fmt.Errorf("type param(max_capacity) should be specified for array field %s of collection %s", field.GetName(), collectionName)
+		return 0, fmt.Errorf("type param(max_capacity) should be specified for array field %s of collection %s", field.GetName(), collectionName)
+	}
+	return maxCapacityPerRow, nil
+}
+
+func validateMaxCapacityPerRow(collectionName string, field *schemapb.FieldSchema) error {
+	_, err := getMaxCapacityPerRow(collectionName, field)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -655,12 +667,12 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	}
 
 	if field.DataType != schemapb.DataType_Array && field.DataType != schemapb.DataType_ArrayOfVector {
-		return fmt.Errorf("Fields in StructArrayField can only be array or array of struct, but field %s is %s", field.Name, field.DataType.String())
+		return fmt.Errorf("fields in StructArrayField can only be array or array of struct, but field %s is %s", field.Name, field.DataType.String())
 	}
 
 	if field.ElementType == schemapb.DataType_ArrayOfStruct || field.ElementType == schemapb.DataType_ArrayOfVector ||
 		field.ElementType == schemapb.DataType_Array {
-		return fmt.Errorf("Nested array is not supported %s", field.Name)
+		return fmt.Errorf("nested array is not supported %s", field.Name)
 	}
 
 	if field.DataType == schemapb.DataType_Array {
@@ -670,7 +682,7 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	} else {
 		// ArrayOfVector: support FloatVector, Float16Vector, BFloat16Vector, Int8Vector, BinaryVector
 		if !typeutil.IsFixDimVectorType(field.GetElementType()) {
-			return fmt.Errorf("Unsupported element type %s of ArrayOfVector field %s, only fixed dimension vector types are supported", field.GetElementType().String(), field.Name)
+			return fmt.Errorf("unsupported element type %s of ArrayOfVector field %s, only fixed dimension vector types are supported", field.GetElementType().String(), field.Name)
 		}
 
 		err = validateDimension(field)
@@ -688,9 +700,11 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 		}
 	}
 
-	// todo(SpadeA): make nullable field in struct array supported
-	if field.GetNullable() {
-		return fmt.Errorf("nullable is not supported for fields in struct array now, fieldName = %s", field.Name)
+	if field.DataType == schemapb.DataType_Array || field.DataType == schemapb.DataType_ArrayOfVector {
+		err = validateMaxCapacityPerRow(schema.Name, field)
+		if err != nil {
+			return err
+		}
 	}
 
 	// Validate warmup policy if specified in field TypeParams
@@ -703,6 +717,29 @@ func ValidateFieldsInStruct(field *schemapb.FieldSchema, schema *schemapb.Collec
 	return nil
 }
 
+func validateStructArrayFieldMaxCapacity(structArrayField *schemapb.StructArrayFieldSchema, collectionName string) error {
+	var expectedMaxCapacity int64
+	hasExpectedMaxCapacity := false
+	for _, subField := range structArrayField.Fields {
+		maxCapacity, err := getMaxCapacityPerRow(collectionName, subField)
+		if err != nil {
+			return err
+		}
+		if !hasExpectedMaxCapacity {
+			expectedMaxCapacity = maxCapacity
+			hasExpectedMaxCapacity = true
+			continue
+		}
+		if maxCapacity != expectedMaxCapacity {
+			return merr.WrapErrParameterInvalidMsg("all sub-fields in struct array field must have the same max_capacity: structName=%s, subFieldName=%s, max_capacity=%d, expected=%d",
+				structArrayField.Name, subField.Name, maxCapacity, expectedMaxCapacity)
+		}
+	}
+	return nil
+}
+
+// ValidateStructArrayField validates the struct array field schema.
+// When the struct is nullable, sub-field schemas are mutated in-place to set Nullable=true.
 func ValidateStructArrayField(structArrayField *schemapb.StructArrayFieldSchema, schema *schemapb.CollectionSchema) error {
 	if len(structArrayField.Fields) == 0 {
 		return fmt.Errorf("struct array field %s has no sub-fields", structArrayField.Name)
@@ -720,6 +757,25 @@ func ValidateStructArrayField(structArrayField *schemapb.StructArrayFieldSchema,
 			return err
 		}
 	}
+	if err := validateStructArrayFieldMaxCapacity(structArrayField, schema.Name); err != nil {
+		return err
+	}
+
+	// If struct is nullable, propagate nullable to all sub-fields
+	if structArrayField.GetNullable() {
+		for _, subField := range structArrayField.Fields {
+			subField.Nullable = true
+		}
+	} else {
+		// If struct is not nullable, sub-fields must not be individually nullable
+		for _, subField := range structArrayField.Fields {
+			if subField.GetNullable() {
+				return merr.WrapErrParameterInvalidMsg("sub-field in non-nullable struct cannot be nullable individually, set nullable on the struct instead: structName=%s, subFieldName=%s",
+					structArrayField.Name, subField.Name)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -765,6 +821,42 @@ func validatePrimaryKey(coll *schemapb.CollectionSchema) error {
 	return nil
 }
 
+// validateReservedFieldNames rejects user-supplied schema fields whose name
+// collides with a system-reserved identifier (RowID, Timestamp,
+// __virtual_pk__). Must be called BEFORE server-side injection of the
+// virtual PK so the check only applies to user input. Applies to regular
+// and struct-array fields alike. Fix for issue #49314.
+func validateReservedFieldNames(schema *schemapb.CollectionSchema) error {
+	reserved := map[string]struct{}{
+		common.RowIDFieldName:     {},
+		common.TimeStampFieldName: {},
+		common.VirtualPKFieldName: {},
+	}
+	check := func(name string) error {
+		if _, ok := reserved[name]; ok {
+			return merr.WrapErrFieldNameInvalid(name,
+				fmt.Sprintf("field name %q is reserved for internal use and cannot be used in user schemas", name))
+		}
+		return nil
+	}
+	for _, f := range schema.GetFields() {
+		if err := check(f.GetName()); err != nil {
+			return err
+		}
+	}
+	for _, saf := range schema.GetStructArrayFields() {
+		if err := check(saf.GetName()); err != nil {
+			return err
+		}
+		for _, f := range saf.GetFields() {
+			if err := check(f.GetName()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // injectVirtualPKForExternalCollection adds a virtual PK field for external collections
 // if no primary key field exists. External collections use virtual PKs in the format:
 // (segmentID << 32) | offset
@@ -781,7 +873,7 @@ func injectVirtualPKForExternalCollection(schema *schemapb.CollectionSchema) err
 	// will assign the actual field ID during collection creation.
 	virtualPKField := &schemapb.FieldSchema{
 		Name:         common.VirtualPKFieldName,
-		Description:  "Virtual primary key for external collection: (segmentID << 32) | offset",
+		Description:  "auto-generated primary key for external collection",
 		DataType:     schemapb.DataType_Int64,
 		IsPrimaryKey: true,
 		AutoID:       true, // Virtual PKs are auto-generated
@@ -1259,12 +1351,12 @@ func validateFieldDataColumns(columns []*schemapb.FieldData, schema *schemaInfo)
 	expectColumnNum := 0
 
 	// Count expected columns
-	for _, field := range schema.CollectionSchema.GetFields() {
-		if !(typeutil.IsBM25FunctionOutputField(field, schema.CollectionSchema) || typeutil.IsMinHashFunctionOutputField(field, schema.CollectionSchema)) {
+	for _, field := range schema.GetFields() {
+		if !typeutil.IsBM25FunctionOutputField(field, schema.CollectionSchema) && !typeutil.IsMinHashFunctionOutputField(field, schema.CollectionSchema) {
 			expectColumnNum++
 		}
 	}
-	for _, structField := range schema.CollectionSchema.GetStructArrayFields() {
+	for _, structField := range schema.GetStructArrayFields() {
 		expectColumnNum += len(structField.GetFields())
 	}
 
@@ -1300,14 +1392,15 @@ func fillFieldPropertiesOnly(columns []*schemapb.FieldData, schema *schemaInfo) 
 		fieldData.Type = fieldSchema.DataType
 
 		// Set the ElementType because it may not be set in the insert request.
-		if fieldData.Type == schemapb.DataType_Array {
+		switch fieldData.Type {
+		case schemapb.DataType_Array:
 			fd, ok := fieldData.Field.(*schemapb.FieldData_Scalars)
 			if !ok || fd.Scalars.GetArrayData() == nil {
 				return fmt.Errorf("field convert FieldData_Scalars fail in fieldData, fieldName: %s, collectionName: %s",
 					fieldData.FieldName, schema.Name)
 			}
 			fd.Scalars.GetArrayData().ElementType = fieldSchema.ElementType
-		} else if fieldData.Type == schemapb.DataType_ArrayOfVector {
+		case schemapb.DataType_ArrayOfVector:
 			fd, ok := fieldData.Field.(*schemapb.FieldData_Vectors)
 			if !ok || fd.Vectors.GetVectorArray() == nil {
 				return fmt.Errorf("field convert FieldData_Vectors fail in fieldData, fieldName: %s, collectionName: %s",
@@ -1965,6 +2058,20 @@ func checkFieldsDataBySchema(allFields []*schemapb.FieldSchema, schema *schemapb
 	return nil
 }
 
+// subFieldHasData checks whether a struct sub-field contains actual data content,
+// not just a protobuf-initialized empty wrapper (e.g. some SDKs may initialize the
+// Vectors oneof by accessing .vectors.dim, making Field non-nil without real data).
+func subFieldHasData(subField *schemapb.FieldData) bool {
+	switch fd := subField.Field.(type) {
+	case *schemapb.FieldData_Scalars:
+		return fd.Scalars.GetData() != nil
+	case *schemapb.FieldData_Vectors:
+		return fd.Vectors.GetData() != nil
+	default:
+		return false
+	}
+}
+
 // checkAndFlattenStructFieldData verifies the array length of the struct array field data in the insert message
 // and then flattens the data so that data node and query node have not to handle the struct array field data.
 func checkAndFlattenStructFieldData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
@@ -2006,6 +2113,63 @@ func checkAndFlattenStructFieldData(schema *schemapb.CollectionSchema, insertMsg
 				structName, schema.Name, len(structArrays.StructArrays.Fields), len(structSchema.GetFields()))
 		}
 
+		// Check sub-field data consistency: within the same struct, all sub-fields must
+		// either have data or all be empty. Partial presence is invalid.
+		hasDataCount := 0
+		for _, subField := range structArrays.StructArrays.Fields {
+			if subFieldHasData(subField) {
+				hasDataCount++
+			}
+		}
+		totalSubFields := len(structArrays.StructArrays.Fields)
+		if hasDataCount == 0 {
+			// All sub-fields have empty payload — equivalent to the struct being
+			// omitted entirely. Reject illegal ValidData first: when no payload is
+			// provided, any ValidData[i]==true contradicts itself.
+			for _, subField := range structArrays.StructArrays.Fields {
+				for j, v := range subField.ValidData {
+					if v {
+						return fmt.Errorf("sub-field '%s' in struct '%s' claims row %d is valid but no payload is provided",
+							subField.FieldName, structName, j)
+					}
+				}
+			}
+			// Skip flatten and let checkFieldsDataBySchema backfill missing sub-fields
+			// uniformly, so scenario "struct omitted" and scenario "struct present but
+			// empty" share one code path downstream.
+			continue
+		}
+		if hasDataCount != totalSubFields {
+			return fmt.Errorf("inconsistent sub-field data in struct '%s': %d of %d sub-fields have data, all must be present or all absent",
+				structName, hasDataCount, totalSubFields)
+		}
+
+		// Validate that all sub-fields share the same ValidData mask.
+		// Nullable is a struct-level concept: a row is either entirely null or entirely present.
+		if structSchema.GetNullable() {
+			var refValidData []bool
+			var refFieldName string
+			refInitialized := false
+			for _, subField := range structArrays.StructArrays.Fields {
+				if !refInitialized {
+					refValidData = subField.ValidData
+					refFieldName = subField.FieldName
+					refInitialized = true
+					continue
+				}
+				if len(subField.ValidData) != len(refValidData) {
+					return fmt.Errorf("sub-field ValidData length mismatch in struct '%s': '%s' has %d, '%s' has %d",
+						structName, refFieldName, len(refValidData), subField.FieldName, len(subField.ValidData))
+				}
+				for j := range refValidData {
+					if subField.ValidData[j] != refValidData[j] {
+						return fmt.Errorf("sub-field ValidData mismatch in struct '%s' at row %d: '%s'=%v, '%s'=%v",
+							structName, j, refFieldName, refValidData[j], subField.FieldName, subField.ValidData[j])
+					}
+				}
+			}
+		}
+
 		// Check the array length of the struct array field data
 		expectedArrayLen := -1
 		for _, subField := range structArrays.StructArrays.Fields {
@@ -2044,15 +2208,24 @@ func checkAndFlattenStructFieldData(schema *schemapb.CollectionSchema, insertMsg
 				Type:      subField.Type,
 				Field:     subField.Field,
 				IsDynamic: subField.IsDynamic,
+				ValidData: subField.ValidData,
 			}
 
 			flattenedFields = append(flattenedFields, subFieldCopy)
 		}
 	}
 
-	if len(schema.GetStructArrayFields()) != structFieldCount {
-		return fmt.Errorf("the number of struct array fields is not the same as needed, expected: %d, actual: %d",
-			len(schema.GetStructArrayFields()), structFieldCount)
+	// Verify all required (non-nullable) struct array fields are provided
+	seenStructs := make(map[string]bool, structFieldCount)
+	for _, fieldData := range insertMsg.GetFieldsData() {
+		if _, ok := structSchemaMap[fieldData.FieldName]; ok {
+			seenStructs[fieldData.FieldName] = true
+		}
+	}
+	for _, sf := range schema.GetStructArrayFields() {
+		if !sf.GetNullable() && !seenStructs[sf.Name] {
+			return fmt.Errorf("required struct array field '%s' is missing in insert data", sf.Name)
+		}
 	}
 
 	insertMsg.FieldsData = flattenedFields
@@ -2540,7 +2713,7 @@ func checkDynamicFieldDataForPartialUpdate(schema *schemapb.CollectionSchema, in
 }
 
 func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.InsertMsg) error {
-	err := common.CheckNamespace(schema, insertMsg.InsertRequest.Namespace)
+	err := common.CheckNamespace(schema, insertMsg.Namespace)
 	if err != nil {
 		return err
 	}
@@ -2558,8 +2731,8 @@ func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.In
 	for _, fieldData := range insertMsg.FieldsData {
 		if fieldData.FieldId == namespaceField.FieldID {
 			ns := ""
-			if insertMsg.InsertRequest.Namespace != nil {
-				ns = *insertMsg.InsertRequest.Namespace
+			if insertMsg.Namespace != nil {
+				ns = *insertMsg.Namespace
 			}
 			scalars := fieldData.GetScalars()
 			if scalars == nil {
@@ -2581,7 +2754,7 @@ func addNamespaceData(schema *schemapb.CollectionSchema, insertMsg *msgstream.In
 
 	// set namespace field data
 	namespaceData := make([]string, insertMsg.NRows())
-	namespace := *insertMsg.InsertRequest.Namespace
+	namespace := *insertMsg.Namespace
 	for i := range namespaceData {
 		namespaceData[i] = namespace
 	}
@@ -2724,6 +2897,9 @@ func GetRequestInfo(ctx context.Context, req proto.Message) (int64, map[int64][]
 		dbID, collToPartIDs, err := getCollectionAndPartitionIDs(ctx, req.(reqPartNames))
 		return dbID, collToPartIDs, internalpb.RateType_DQLQuery, 1, err // think of the query request's nq as 1
 	case *milvuspb.CreateCollectionRequest:
+		dbID, collToPartIDs := getCollectionID(req.(reqCollName))
+		return dbID, collToPartIDs, internalpb.RateType_DDLCollection, 1, nil
+	case *milvuspb.RefreshExternalCollectionRequest:
 		dbID, collToPartIDs := getCollectionID(req.(reqCollName))
 		return dbID, collToPartIDs, internalpb.RateType_DDLCollection, 1, nil
 	case *milvuspb.DropCollectionRequest:
@@ -3125,7 +3301,7 @@ func genFunctionFields(ctx context.Context, insertMsg *msgstream.InsertMsg, sche
 		return err
 	}
 
-	if embedding.HasNonBM25AndMinHashFunctions(schema.CollectionSchema.Functions, []int64{}) {
+	if embedding.HasNonBM25AndMinHashFunctions(schema.Functions, []int64{}) {
 		ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-genFunctionFields-call-function-udf")
 		defer sp.End()
 		exec, err := embedding.NewFunctionExecutor(schema.CollectionSchema, needProcessFunctions, &models.ModelExtraInfo{ClusterID: paramtable.Get().CommonCfg.ClusterPrefix.GetValue(), DBName: insertMsg.GetDbName()})

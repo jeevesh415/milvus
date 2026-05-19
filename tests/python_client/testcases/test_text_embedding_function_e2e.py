@@ -181,7 +181,7 @@ class TestCreateCollectionWithTextEmbeddingNegative(TestcaseBase):
             check_task=CheckTasks.err_res,
             check_items={
                 "err_code": 65535,
-                "err_msg": f"The required embedding dim is [{dim}], but the embedding obtained from the model is [768]",
+                "err_msg": f"the required embedding dim is [{dim}], but the embedding obtained from the model is [768]",
             },
         )
 
@@ -432,7 +432,7 @@ class TestInsertWithTextEmbeddingNegative(TestcaseBase):
             check_task=CheckTasks.err_res,
             check_items={
                 "err_code": 65535,
-                "err_msg": "Call service faild",
+                "err_msg": "call service failed",
             },
         )
         assert collection_w.num_entities == 0
@@ -727,7 +727,7 @@ class TestSearchWithTextEmbeddingNegative(TestcaseBase):
             limit=3,
             output_fields=["document"],
             check_task=CheckTasks.err_res,
-            check_items={"err_code": 65535, "err_msg": "Call service faild"},
+            check_items={"err_code": 65535, "err_msg": "call service failed"},
         )
 
 
@@ -2214,7 +2214,7 @@ class TestTextEmbeddingFunctionCURDNegative(TestcaseBase):
         except Exception as e:
             log.info(f"Expected error: {e}")
             assert e.code == 65535
-            assert "Check function" in str(e) and "failed" in str(e)
+            assert "check function" in str(e).lower() and "failed" in str(e).lower()
 
     # ==================== drop_collection_function negative tests ====================
 

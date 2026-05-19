@@ -32,20 +32,20 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
 	"github.com/milvus-io/milvus/internal/compaction"
 	"github.com/milvus-io/milvus/internal/datacoord/allocator"
 	"github.com/milvus-io/milvus/internal/metastore/mocks"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/pkg/v2/common"
-	"github.com/milvus-io/milvus/pkg/v2/log"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
-	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
-	"github.com/milvus-io/milvus/pkg/v2/util/tsoutil"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/common"
+	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
+	"github.com/milvus-io/milvus/pkg/v3/util/tsoutil"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 type spyCompactionInspector struct {
@@ -524,7 +524,7 @@ func Test_compactionTrigger_force(t *testing.T) {
 	im.segmentIndexes.Insert(2, segIdx2)
 	im.segmentIndexes.Insert(3, segIdx3)
 
-	params, err := compaction.GenerateJSONParams()
+	params, err := compaction.GenerateJSONParams(nil)
 	if err != nil {
 		panic(err)
 	}
@@ -2003,6 +2003,67 @@ func Test_compactionTrigger_new(t *testing.T) {
 	}
 }
 
+func TestCompactionTriggerKeepsMixedSchemaVersionSegments(t *testing.T) {
+	paramtable.Init()
+
+	collectionID := int64(1)
+	partitionID := int64(10)
+	channel := "ch-1"
+	schema := newTestSchema()
+	schema.Version = 5
+	mt := &meta{
+		segments:    NewSegmentsInfo(),
+		indexMeta:   newSegmentIndexMeta(nil),
+		collections: typeutil.NewConcurrentMap[UniqueID, *collectionInfo](),
+	}
+	mt.collections.Insert(collectionID, &collectionInfo{ID: collectionID, Schema: schema})
+
+	for _, item := range []struct {
+		id            int64
+		schemaVersion int32
+	}{
+		{id: 101, schemaVersion: 3},
+		{id: 102, schemaVersion: 5},
+		{id: 103, schemaVersion: 4},
+	} {
+		mt.segments.SetSegment(item.id, &SegmentInfo{SegmentInfo: &datapb.SegmentInfo{
+			ID:            item.id,
+			CollectionID:  collectionID,
+			PartitionID:   partitionID,
+			InsertChannel: channel,
+			State:         commonpb.SegmentState_Flushed,
+			Level:         datapb.SegmentLevel_L1,
+			IsSorted:      true,
+			NumOfRows:     10,
+			MaxRowNum:     100,
+			SchemaVersion: item.schemaVersion,
+			Binlogs:       []*datapb.FieldBinlog{{FieldID: 1, Binlogs: []*datapb.Binlog{{EntriesNum: 10, MemorySize: 1}}}},
+		}})
+	}
+
+	inspector := &spyCompactionInspector{t: t, spyChan: make(chan *datapb.CompactionPlan, 1), meta: mt}
+	trigger := newCompactionTrigger(mt, inspector, newMock0Allocator(t), newMockHandlerWithMeta(mt), newMockVersionManager())
+	err := trigger.handleSignal(&compactionSignal{
+		id:           1,
+		collectionID: collectionID,
+		partitionID:  partitionID,
+		channel:      channel,
+		isForce:      true,
+	})
+	assert.NoError(t, err)
+
+	select {
+	case plan := <-inspector.spyChan:
+		var got []int64
+		for _, segment := range plan.GetSegmentBinlogs() {
+			got = append(got, segment.GetSegmentID())
+		}
+		assert.ElementsMatch(t, []int64{101, 102, 103}, got)
+	case <-time.After(time.Second):
+		assert.Fail(t, "expected compaction plan for mixed schema version segments")
+	}
+}
+
 func Test_compactionTrigger_getCompactTime(t *testing.T) {
 	coll := &collectionInfo{
 		ID:         1,
@@ -2080,9 +2141,10 @@ func Test_TirggerCompaction_WaitResult(t *testing.T) {
 			case signal := <-got.signals:
 				x := j.Load().(int)
 				j.Store(x + 1)
-				if x == 0 {
+				switch x {
+				case 0:
 					assert.EqualValues(t, 3, signal.collectionID)
-				} else if x == 1 {
+				case 1:
 					assert.EqualValues(t, 4, signal.collectionID)
 				}
 				signal.Notify(nil)

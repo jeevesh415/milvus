@@ -5,16 +5,16 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/milvus-io/milvus-proto/go-api/v2/commonpb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/milvuspb"
-	"github.com/milvus-io/milvus-proto/go-api/v2/msgpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
+	"github.com/milvus-io/milvus-proto/go-api/v3/msgpb"
 	"github.com/milvus-io/milvus/internal/metastore/model"
-	"github.com/milvus-io/milvus/pkg/v2/proto/datapb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/indexpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
-	"github.com/milvus-io/milvus/pkg/v2/proto/streamingpb"
-	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
+	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/querypb"
+	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
+	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
 //go:generate mockery --name=RootCoordCatalog
@@ -130,6 +130,12 @@ func (t AlterType) String() string {
 type BinlogsIncrement struct {
 	Segment    *datapb.SegmentInfo
 	UpdateMask BinlogsUpdateMask
+	// DroppedBinlogFieldIDs lists FieldBinlog.FieldID values whose insert-binlog
+	// KV entries must be removed from etcd. AlterSegments only upserts; without
+	// explicit removal, a prefix scan in listBinlogs will resurrect the zombie
+	// entry on restart. Used by operators (e.g. V2 column-group backfill commit)
+	// that structurally drop a FieldBinlog from segment.Binlogs.
+	DroppedBinlogFieldIDs []int64
 }
 
 type BinlogsUpdateMask struct {
